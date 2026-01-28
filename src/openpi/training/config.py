@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.dobot_cr3_policy as dobot_cr3_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -89,6 +90,10 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # Video decoding backend for LeRobot datasets. If None, use LeRobot defaults.
+    # Supported: "torchcodec", "pyav", "video_reader".
+    video_backend: str | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -353,6 +358,106 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotDobotCR3DataConfig(DataConfigFactory):
+    """
+    Dobot CR3 自定义数据集配置类（LeRobot格式）。
+
+    该配置适配你的本地数据集结构：
+    - 图像键："observation.images.top"（视频帧）
+    - 状态键："observation.state"（7维）
+    - 动作键："action"（7维，单数）
+    
+    处理策略（与 convert_to_lerobot.py 输出一致）：
+    1) 将 observation.images.top / observation.state / action 映射到模型期望键
+    2) 使用 DobotCR3Inputs/DobotCR3Outputs 作为自定义输入/输出适配
+    3) 使用标准 ModelTransformFactory 进行提示词、图像缩放、padding
+    """
+
+    # ============ 动作键配置 =========
+    # 使用单数 "action" 作为动作序列键。
+    # 说明：LeRobot 数据集中动作字段名为 "action"（单数），
+    # 这里显式指定，避免默认的 "actions"（复数）导致取值失败。
+    # 作用：数据加载器在构造动作序列时会读取该键，序列长度由模型的
+    #       action_horizon 决定。
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    # ============ 提示词配置 =========
+    # 若数据集中没有 prompt，可使用默认提示词兜底。
+    # 注意：如果 prompt_from_task=True，则优先使用 task 生成的 prompt，
+    #       default_prompt 仅在数据中缺失 prompt 字段时才会被注入。
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        """
+        创建 Dobot CR3 数据配置。
+
+                - observation.images.top 映射为 observation/image 与 observation/wrist_image
+                    （无腕部相机时用同一视角占位，确保下游输入结构完整）
+                - observation.state 保持为 observation/state
+                - action -> actions
+                - 强制 prompt_from_task=True 以使用 tasks.jsonl 生成 prompt
+        """
+        # 1) 重新打包（repack）转换：
+        #    将你的 LeRobot 原始字段结构，映射到模型推理/训练管道期望的字段结构。
+        #    这里把 observation.images.top 复用为 image/wrist_image 两个键，
+        #    以满足模型输入对“主视角+腕部视角”的结构要求。
+        #    同时把单数 "action" 重命名为通用的 "actions"。
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # observation 子结构：模型期望 observation/image、observation/wrist_image、observation/state
+                        "observation/image": "observation.images.top",
+                        "observation/wrist_image": "observation.images.top",
+                        "observation/state": "observation.state",
+                        # 统一动作键名到 "actions"
+                        "actions": "action",
+                        # prompt 字段沿用（如不存在可由后续注入默认 prompt）
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # 2) 数据级转换：
+        #    使用 Dobot CR3 的自定义输入/输出适配层。
+        #    这些转换在归一化之前执行，主要做：
+        #    - 图像/状态的格式整理
+        #    - 动作/输出的统一表示
+        #    - 与模型类型（PI0/PI05/PI0_FAST）相关的分支处理
+        data_transforms = _transforms.Group(
+            inputs=[dobot_cr3_policy.DobotCR3Inputs(model_type=model_config.model_type)],
+            outputs=[dobot_cr3_policy.DobotCR3Outputs()],
+        )
+
+        # 3) 模型级转换：
+        #    包含提示词注入、图像缩放、tokenizer 处理、动作/状态 padding 等。
+        #    default_prompt 会在缺失 prompt 时被注入。
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        # 4) 构建基础配置（包含 repo_id、asset_id、norm_stats 等）。
+        base_config = self.create_base_config(assets_dirs, model_config)
+        if not base_config.prompt_from_task:
+            # 强制启用 prompt_from_task：
+            # 让数据加载器优先从 tasks.jsonl 的 task 字段生成 prompt。
+            base_config = dataclasses.replace(base_config, prompt_from_task=True)
+        if base_config.norm_stats is None:
+            # 若未提供规范化统计，默认禁用归一化（避免训练时报错）
+            base_config = dataclasses.replace(base_config, norm_stats={})
+
+        # 5) 汇总并返回完整的数据配置。
+        #    将 repack/data/model transforms 与动作序列键注入最终 DataConfig。
+        return dataclasses.replace(
+            base_config,
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -675,6 +780,33 @@ _CONFIGS = [
         # Check the base TrainConfig class for a full list of available hyperparameters.
         num_train_steps=30_000,
     ),
+    # ================================================================
+    # Dobot CR3 自定义数据集微调配置（本地 LeRobot 数据集）
+    # ================================================================
+    TrainConfig(
+        name="pi0_dobot_cr3",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotDobotCR3DataConfig(
+            # 指向你本地的 LeRobot 数据集目录
+            # repo_id="/mnt/data/lv_qi/xing/openpi/src/openpi/lerobot_dataset",
+            # repo_id="/mnt/data/lv_qi/xing/openpi/my_data",
+            repo_id="/home/hit/openpi/my_data/my_data",
+            # 如果 tasks.jsonl 存在，建议开启 prompt_from_task
+            base_config=DataConfig(prompt_from_task=True, video_backend="pyav"),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/home/hit/openpi/checkpoints/pi05_base_pytorch",
+        num_train_steps=30_000,
+    ),
     TrainConfig(
         name="pi0_libero_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
@@ -744,11 +876,14 @@ _CONFIGS = [
         name="pi05_libero",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
+            # repo_id="physical-intelligence/libero",
+            repo_id="/mnt/data/lv_qi/xing/openpi/libero",
+            # repo_id="libero",
+            # repo_type="local",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
-        batch_size=256,
+        batch_size=8,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -758,8 +893,45 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        pytorch_weight_path="/mnt/data/lv_qi/xing/openpi/checkpoints/pi05_base_pytorch",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_libero_low_mem_finetune",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(
+            pi05=True, 
+            action_horizon=10, 
+            discrete_state_input=False, 
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora"
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="/mnt/data/lv_qi/xing/openpi/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size=32, #use fault 32
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
     ),
     #
     # Fine-tuning Aloha configs.

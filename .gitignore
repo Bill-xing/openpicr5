@@ -166,3 +166,27 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+libero/.gitattributes
+libero/README.md
+libero/.hfd/last_download_command
+libero/.hfd/repo_metadata.json
+libero/.hfd/wget_urls.txt
+libero/meta/episodes.jsonl
+libero/meta/info.json
+libero/meta/stats.json
+libero/meta/tasks.jsonl
+libero/*
+
+third_party/libero
+third_party/libero
+third_party/libero
+src/openpi/lerobot_dataset/meta/episodes.jsonl
+src/openpi/lerobot_dataset/meta/info.json
+src/openpi/lerobot_dataset/meta/stats.json
+src/openpi/lerobot_dataset/meta/tasks.jsonl
+src/openpi/lerobot_dataset/videos/observation.images.top/chunk-000/episode_000000.mp4
+src/openpi/lerobot_dataset/videos/observation.images.top/chunk-000/episode_000001.mp4
+src/openpi/lerobot_dataset/videos/observation.images.top/chunk-000/episode_000002.mp4
+src/openpi/lerobot_dataset/videos/observation.images.top/chunk-000/episode_000003.mp4
+/mnt/data/lv_qi/xing/openpi/my_data/*
+my_data/*
