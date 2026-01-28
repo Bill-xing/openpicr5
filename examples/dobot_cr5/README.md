@@ -1,4 +1,17 @@
+
+使用的命令
+一个终端
+python examples/dobot_cr5/main.py       --args.prompt "Pick up the red block and place it on the plate"       --args.max-steps 400
+另一个终端
+uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_dobot_cr3 --policy.dir=/home/hit/openpi/checkpoints/pi0_dobot_cr3/21000
+
+
+
 # CR5 真机推理客户端
+
+
+
+
 
 用于在 Dobot CR5 真机上执行策略推理的客户端。
 

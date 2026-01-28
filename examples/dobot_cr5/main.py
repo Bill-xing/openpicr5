@@ -19,6 +19,7 @@ CR5 真机推理客户端
 
 import dataclasses
 import logging
+import queue
 import re
 import threading
 import time
@@ -236,6 +237,11 @@ class CR5InferenceNode(Node):
         self.step_count = 0  # 执行步数计数
         self.bridge = CvBridge()
 
+        # 推理队列（线程安全）
+        self.inference_queue = queue.Queue(maxsize=2)  # 最多缓存2帧图像
+        self.inference_thread = None
+        self.inference_running = False
+
         # ========== 服务客户端 ==========
         self.cli_enable = self.create_client(
             EnableRobot, "/dobot_bringup_v3/srv/EnableRobot"
@@ -250,8 +256,17 @@ class CR5InferenceNode(Node):
         self.cli_get_pose = self.create_client(GetPose, "/dobot_bringup_v3/srv/GetPose")
 
         # ========== QoS配置 ==========
+        # 相机话题使用BEST_EFFORT（RealSense默认配置）
         sensor_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+
+        # 机器人状态话题使用RELIABLE（匹配dobot_feedback发布者）
+        robot_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,  # 必须与发布者匹配
             durability=QoSDurabilityPolicy.VOLATILE,
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=10,
@@ -267,7 +282,7 @@ class CR5InferenceNode(Node):
             ToolVectorActual,
             "/dobot_msgs_v3/msg/ToolVectorActual",
             self.robot_current_callback,
-            sensor_qos,
+            robot_qos,
         )
 
         # ========== 发布器（与data_collector4兼容）==========
@@ -297,13 +312,18 @@ class CR5InferenceNode(Node):
 
     def robot_current_callback(self, msg: ToolVectorActual):
         """机器人当前位姿回调"""
+        if self.robot_state is None:
+            logging.info("Robot state callback received first message")
         self.robot_state = np.array(
             [msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz], dtype=np.float32
         )
 
     def image_callback(self, msg: Image):
-        """图像回调 - 触发推理（30Hz）"""
+        """图像回调 - 非阻塞，只负责数据采集（30Hz）"""
+        if self.latest_image is None:
+            logging.info("Image callback received first message")
         if not self.inference_enabled:
+            self.latest_image = True  # 标记已收到图像
             return
 
         # 检查是否达到最大步数
@@ -321,22 +341,12 @@ class CR5InferenceNode(Node):
 
         self.latest_image = cv_image
 
-        # 构建观测并执行推理
-        obs = self._build_observation(cv_image)
-        if obs is None:
-            return
-
-        # 获取动作
-        action = self._get_action(obs)
-        if action is None:
-            return
-
-        # 执行动作
-        self._execute_action(action)
-        self.step_count += 1
-
-        if self.step_count % 30 == 0:
-            logging.info(f"Step {self.step_count}, queue size: {len(self.action_queue)}")
+        # 非阻塞入队：如果队列满了，丢弃旧帧
+        try:
+            self.inference_queue.put_nowait(cv_image)
+        except queue.Full:
+            # 队列满，丢弃当前帧（推理线程处理不过来）
+            pass
 
     def _build_observation(self, cv_image: np.ndarray):
         """构建观测数据"""
@@ -351,6 +361,8 @@ class CR5InferenceNode(Node):
             return None
 
         # 图像预处理：BGR→RGB，resize到224x224
+        if self.step_count == 0:
+            logging.info("Building first observation...")
         img = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
         img = image_tools.resize_with_pad(img, self.args.resize_size, self.args.resize_size)
         img = image_tools.convert_to_uint8(img)
@@ -376,7 +388,11 @@ class CR5InferenceNode(Node):
         # 如果动作队列为空，调用策略推理
         if not self.action_queue:
             try:
+                if self.step_count == 0:
+                    logging.info("Calling policy inference for first time...")
                 result = self.policy_client.infer(obs)
+                if self.step_count == 0:
+                    logging.info("First inference completed!")
                 actions = result["actions"]  # (action_horizon, 7)
 
                 # 只取前replan_steps个动作
@@ -395,8 +411,9 @@ class CR5InferenceNode(Node):
     def _execute_action(self, action: np.ndarray):
         """执行动作"""
         # action: (7,) [x,y,z,rx,ry,rz,gripper]
+        # 注意：模型输出的动作已经是反归一化后的原始值！
 
-        # 1. 提取目标位姿
+        # 1. 提取目标位姿（单位：mm, 度）
         target_pose = [
             float(action[0]),
             float(action[1]),
@@ -406,8 +423,13 @@ class CR5InferenceNode(Node):
             float(action[5]),
         ]
 
-        # 2. 提取夹爪目标（归一化值 0-1 -> 0-1000）
-        gripper_target = int(np.clip(action[6] * 1000, 0, 1000))
+        # 2. 提取夹爪目标（模型输出已经是原始值 280-1000，不需要再乘1000）
+        gripper_raw = float(action[6])
+        gripper_target = int(np.clip(gripper_raw, 0, 1000))
+
+        # 每100步打印一次原始动作值用于调试
+        if self.step_count % 100 == 0:
+            logging.info(f"Action[{self.step_count}]: gripper_raw={gripper_raw:.1f}, gripper_target={gripper_target}")
 
         if self.args.dry_run:
             # 空运行模式：只打印
@@ -461,6 +483,84 @@ class CR5InferenceNode(Node):
         msg_current.header.frame_id = "gripper_feedback"
         msg_current.point.x = float(self.gripper_controller.current_pos)
         self.pub_gripper_state.publish(msg_current)
+
+    def _inference_loop(self):
+        """推理线程主循环 - 独立线程中运行"""
+        logging.info("Inference thread started")
+
+        while self.inference_running and self.inference_enabled:
+            try:
+                # 从队列获取图像（阻塞，超时1秒）
+                try:
+                    cv_image = self.inference_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+
+                # 检查是否需要停止
+                if self.step_count >= self.args.max_steps:
+                    logging.info(f"Reached max steps ({self.args.max_steps}), stopping...")
+                    self.inference_enabled = False
+                    break
+
+                # 构建观测
+                obs = self._build_observation(cv_image)
+                if obs is None:
+                    continue
+
+                # 获取动作
+                action = self._get_action(obs)
+                if action is None:
+                    continue
+
+                # 执行动作
+                self._execute_action(action)
+                self.step_count += 1
+
+                # 定期打印状态
+                if self.step_count % 30 == 0:
+                    logging.info(
+                        f"Step {self.step_count}, "
+                        f"action queue: {len(self.action_queue)}, "
+                        f"image queue: {self.inference_queue.qsize()}"
+                    )
+
+            except Exception as e:
+                logging.error(f"Error in inference loop: {e}", exc_info=True)
+                time.sleep(0.1)
+
+        logging.info("Inference thread stopped")
+
+    def start_inference_thread(self):
+        """启动推理线程"""
+        if self.inference_thread is not None:
+            logging.warning("Inference thread already running")
+            return
+
+        self.inference_running = True
+        self.inference_thread = threading.Thread(
+            target=self._inference_loop,
+            daemon=True,
+            name="InferenceThread"
+        )
+        self.inference_thread.start()
+        logging.info("Inference thread launched")
+
+    def stop_inference_thread(self):
+        """停止推理线程"""
+        if self.inference_thread is None:
+            return
+
+        logging.info("Stopping inference thread...")
+        self.inference_running = False
+
+        # 等待线程结束，设置合理的超时
+        if self.inference_thread.is_alive():
+            self.inference_thread.join(timeout=3.0)
+            if self.inference_thread.is_alive():
+                logging.warning("Inference thread did not stop gracefully")
+
+        self.inference_thread = None
+        logging.info("Inference thread stopped")
 
     def enable_robot(self):
         """使能机器人"""
@@ -561,6 +661,9 @@ def run_inference(args: Args):
         logging.info("=" * 60)
         node.inference_enabled = True
 
+        # 启动推理线程
+        node.start_inference_thread()
+
         # 主循环 - 等待推理完成或用户中断
         while node.inference_enabled and rclpy.ok():
             time.sleep(0.1)
@@ -573,6 +676,10 @@ def run_inference(args: Args):
         logging.error(f"Error: {e}")
         raise
     finally:
+        # 停止推理线程
+        if hasattr(node, "inference_thread"):
+            node.stop_inference_thread()
+
         # 停止夹爪控制器
         if hasattr(node, "gripper_controller"):
             node.gripper_controller.stop()
