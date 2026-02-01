@@ -1054,7 +1054,7 @@ class InferenceClient:
         参考: template.py 的 generate_trajectory
 
         当夹爪跳变较大时，扩展动作步数以实现平滑过渡。
-        机械臂在原始步数内正常执行，超出部分保持末尾位置。
+        机械臂和夹爪都进行线性插值，在整个轨迹上均匀重新采样。
 
         Args:
             actions: 原始动作序列 (N, 7)
@@ -1095,15 +1095,27 @@ class InferenceClient:
         target_gripper = float(actions[-1, 6])  # 最终夹爪目标
 
         for step in range(total_steps):
-            # 机械臂位姿：在原始范围内使用原始值，超出保持末尾
-            if step < original_steps:
-                arm_pose = actions[step, :6]
+            # === 方案3：在整个轨迹上重新采样 ===
+            # 计算当前步对应原始轨迹的位置
+            if total_steps == 1:
+                progress = 0
             else:
-                arm_pose = actions[-1, :6]
+                progress = step / (total_steps - 1) * (original_steps - 1)
 
-            # 夹爪：线性插值
-            progress = (step + 1) / total_steps
-            gripper_value = start_gripper + progress * (target_gripper - start_gripper)
+            # 找到相邻的两个原始动作
+            idx_low = int(np.floor(progress))
+            idx_high = min(idx_low + 1, original_steps - 1)
+            alpha = progress - idx_low  # 插值系数 [0, 1]
+
+            # 机械臂位姿：线性插值
+            if idx_high == idx_low:
+                arm_pose = actions[idx_low, :6]
+            else:
+                arm_pose = actions[idx_low, :6] * (1 - alpha) + actions[idx_high, :6] * alpha
+
+            # 夹爪：全局线性插值（从上次值到最终目标）
+            progress_global = (step + 1) / total_steps
+            gripper_value = start_gripper + progress_global * (target_gripper - start_gripper)
 
             interpolated[step, :6] = arm_pose
             interpolated[step, 6] = gripper_value
