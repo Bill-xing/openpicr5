@@ -67,9 +67,9 @@ ros2 launch dobot_bringup_v3 dobot_bringup_ros2.launch.py
 
 ```bash
 cd /home/xing/openpi-main
-uv run python scripts/serve_policy.py \
-    --policy.config pi0_dobot_cr3 \
-    --policy.dir checkpoints/pi0_dobot_cr3/minedata_multi_gpu/25000
+  uv run python scripts/serve_policy.py policy:checkpoint \
+      --policy.config pi0_dobot_cr3 \
+      --policy.dir /home/hit/openpi/checkpoints/pi0_dobot_cr3/21000
 ```
 
 ### 4. 启动推理客户端
