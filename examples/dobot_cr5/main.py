@@ -28,7 +28,6 @@ ROS话题：
 python examples/dobot_cr5/main.py --host localhost --port 8000 --prompt "pick up the red block"
 """
 
-import bisect
 import dataclasses
 from datetime import datetime
 import logging
@@ -85,9 +84,9 @@ class Args:
     prompt: str = "pick up the object"  # 任务描述
 
     # 执行参数
-    max_steps: int = 1000  # 最大执行步数
+    max_steps: int = 500  # 最大执行步数
     dry_run: bool = False  # 空运行模式：只打印动作，不执行
-    blocking_servo: bool = False  # 阻塞执行模式：等待 ServoP 服务调用完成
+    blocking_servo: bool = True  # 阻塞执行模式：等待 ServoP 服务调用完成
 
     # 数据记录参数
     record: bool = False  # 是否启用数据记录
@@ -394,10 +393,6 @@ class DobotRosWrapper(Node):
         self.latest_image = None
         self.bridge = CvBridge()
 
-        # 新增：带时间戳的历史缓冲区（环形队列）
-        self.image_buffer = deque(maxlen=60)      # (timestamp, cv_image) 最多保留60帧（2秒@30Hz）
-        self.state_buffer = deque(maxlen=200)     # (timestamp, state) 最多保留200帧（2秒@100Hz）
-
         self.sub_image = self.create_subscription(
             Image, "/camera/color/image_raw", self._image_callback, sensor_qos
         )
@@ -413,31 +408,18 @@ class DobotRosWrapper(Node):
             self.get_logger().warn("Dobot服务未就绪")
 
     def _image_callback(self, msg: Image):
-        """图像回调 - 保存带时间戳的图像"""
+        """图像回调 - 保存最新图像"""
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-
-            # 保存到历史缓冲区
-            self.image_buffer.append((timestamp, cv_image))
-
-            # 保持兼容性
             self.latest_image = cv_image
         except Exception as e:
             self.get_logger().error(f"Image conversion failed: {e}")
 
     def _robot_current_callback(self, msg: ToolVectorActual):
-        """机器人当前位姿回调 - 保存带时间戳的状态"""
-        state = np.array(
+        """机器人当前位姿回调"""
+        self.robot_state = np.array(
             [msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz], dtype=np.float32
         )
-        timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-
-        # 保存到历史缓冲区
-        self.state_buffer.append((timestamp, state))
-
-        # 保持兼容性
-        self.robot_state = state
 
     def call_service(self, client, request):
         """
@@ -787,11 +769,17 @@ class InferenceClient:
         # 动作队列跟踪（用于记录）
         self.current_action_index = 0  # 当前执行的动作在队列中的索引
         self.current_inference_step = 0  # 当前动作来自哪次推理
-        self.current_image_timestamp = None  # 当前图像时间戳（用于帧间隔记录）
 
-        # 夹爪插值平滑参数
-        self.gripper_step_length = 20  # 夹爪每步最大变化量（跳变200需要10步）
-        self.last_gripper_value = None  # 上次夹爪目标值
+        # 多维度插值步长参数（基于 Dobot CR5 特性）
+        self.step_lengths = np.array([
+            5.0,    # x (mm) - 30Hz × 5mm = 150mm/s 最大速度
+            5.0,    # y (mm)
+            5.0,    # z (mm)
+            3.0,    # rx (度) - 30Hz × 3° = 90°/s 最大旋转
+            3.0,    # ry (度)
+            3.0,    # rz (度)
+            20.0    # gripper (0-1000) - 跳变200需10步
+        ], dtype=np.float32)
 
         logging.info("=== 推理客户端初始化完成 ===")
         logging.info(f"策略服务器: {args.host}:{args.port}")
@@ -885,6 +873,27 @@ class InferenceClient:
                 pass
         return None
 
+    def _get_current_state(self) -> np.ndarray:
+        """
+        获取当前实际状态（用于插值）
+
+        Returns:
+            当前状态向量 [x, y, z, rx, ry, rz, gripper]，如果数据不可用则返回None
+        """
+        if self.node.robot_state is None:
+            return None
+
+        # 机械臂实际反馈位姿
+        robot_pose = self.node.robot_state.copy()  # (6,)
+
+        # 夹爪实际反馈位置（0-1000）
+        gripper_pos = self.gripper_feedback.current_real_pos
+        if gripper_pos is None:
+            # 降级：使用目标位置
+            gripper_pos = self.gripper_target_pos[0]
+
+        return np.concatenate([robot_pose, [gripper_pos]]).astype(np.float32)
+
     def publish_robot_target(self, pose):
         """
         发布机械臂目标姿态
@@ -903,142 +912,28 @@ class InferenceClient:
         msg.rz = float(pose[5])
         self.node.pub_robot_target.publish(msg)
 
-    def interpolate_state_fast(self, buffer, target_time):
-        """
-        高效插值算法 - 使用二分查找定位，线性插值数据
-
-        参考：recorder_optimized.py:345-450
-
-        Args:
-            buffer (deque): 存储(时间戳, 状态)的缓冲区
-            target_time (float): 目标时间戳
-
-        Returns:
-            插值后的状态数组 (6,) 或 None
-        """
-        if len(buffer) < 2:
-            if buffer:
-                _, state = buffer[-1]
-                return state
-            return None
-
-        # deque转列表
-        buffer_list = list(buffer)
-        timestamps = [t for t, _ in buffer_list]
-
-        # 二分查找
-        idx = bisect.bisect_left(timestamps, target_time)
-
-        # 边界情况
-        if idx == 0:
-            return buffer_list[0][1]
-        if idx == len(buffer_list):
-            return buffer_list[-1][1]
-
-        # 获取前后两个点
-        t_before, state_before = buffer_list[idx - 1]
-        t_after, state_after = buffer_list[idx]
-
-        # 时间戳完全匹配
-        if abs(t_before - target_time) < 1e-6:
-            return state_before
-        if abs(t_after - target_time) < 1e-6:
-            return state_after
-
-        # 线性插值
-        alpha = (target_time - t_before) / (t_after - t_before)
-        alpha = max(0.0, min(1.0, alpha))
-
-        interpolated = state_before * (1 - alpha) + state_after * alpha
-        return interpolated
-
-    def find_closest_image(self, target_time, tolerance=0.1):
-        """
-        高效查找最接近的图像（用于图像同步）
-
-        参考：recorder_optimized.py:452-519
-
-        Args:
-            target_time (float): 目标时间戳
-            tolerance (float): 时间容差（秒），默认0.1秒
-
-        Returns:
-            tuple: (timestamp, cv_image) 或 None
-        """
-        if not self.node.image_buffer:
-            return None
-
-        buffer_list = list(self.node.image_buffer)
-        timestamps = [t for t, _ in buffer_list]
-
-        # 二分查找
-        idx = bisect.bisect_left(timestamps, target_time)
-
-        if idx == 0:
-            t, img = buffer_list[0]
-            if abs(t - target_time) <= tolerance:
-                return (t, img)
-            return None
-
-        if idx == len(buffer_list):
-            t, img = buffer_list[-1]
-            if abs(t - target_time) <= tolerance:
-                return (t, img)
-            return None
-
-        # 比较前后两个，返回更接近的
-        t_before, img_before = buffer_list[idx - 1]
-        t_after, img_after = buffer_list[idx]
-
-        diff_before = abs(t_before - target_time)
-        diff_after = abs(t_after - target_time)
-
-        if diff_before < diff_after and diff_before <= tolerance:
-            return (t_before, img_before)
-        elif diff_after <= tolerance:
-            return (t_after, img_after)
-
-        return None
-
     def _build_observation(self):
-        """构建观测数据（带时间同步）"""
-        # 1. 检查缓冲区
-        if not self.node.image_buffer or not self.node.state_buffer:
-            logging.warning("Insufficient data for observation")
+        """构建观测数据（简化版，无时间同步）"""
+        if self.node.robot_state is None or self.node.latest_image is None:
             return None
 
-        # 2. 以最新图像时间戳为基准
-        img_timestamp, cv_image = self.node.image_buffer[-1]
+        cv_image = self.node.latest_image
 
-        # 3. 在图像时间戳处插值机器人状态
-        robot_state = self.interpolate_state_fast(
-            self.node.state_buffer,
-            img_timestamp
-        )
-
-        if robot_state is None:
-            logging.warning("Could not interpolate robot state")
-            return None
-
-        # 4. 图像预处理
+        # 图像预处理
         img = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
         img = image_tools.resize_with_pad(img, self.args.resize_size, self.args.resize_size)
         img = image_tools.convert_to_uint8(img)
 
-        # 5. 夹爪状态（使用当前值，因为没有时间戳）
-        gripper_normalized = self.gripper_target_pos[0] / 1000.0
+        # 使用实际反馈位置（关键！）
+        gripper_pos = self.gripper_feedback.current_real_pos
+        if gripper_pos is None:
+            # 降级：使用目标位置
+            gripper_pos = self.gripper_target_pos[0]
 
-        # 6. 状态向量
-        state = np.concatenate([robot_state, [gripper_normalized]]).astype(np.float32)
+        gripper_normalized = gripper_pos / 1000.0
 
-        # 7. 记录同步信息（可选，用于调试）
-        if self.step_count % 100 == 0:
-            # 计算时间差
-            state_timestamps = [t for t, _ in self.node.state_buffer]
-            closest_state_time = min(state_timestamps, key=lambda t: abs(t - img_timestamp))
-            time_diff = abs(closest_state_time - img_timestamp)
-            logging.info(f"Time sync: img_time={img_timestamp:.6f}, "
-                        f"state_time_diff={time_diff*1000:.1f}ms")
+        # 拼接状态
+        state = np.concatenate([self.node.robot_state, [gripper_normalized]]).astype(np.float32)
 
         return {
             "observation/image": img,
@@ -1047,17 +942,63 @@ class InferenceClient:
             "prompt": self.args.prompt,
         }
 
-    def _generate_interpolated_actions(self, actions: np.ndarray) -> np.ndarray:
+    def _should_interpolate(
+        self,
+        actions: np.ndarray,
+        current_state: np.ndarray
+    ) -> tuple[bool, int]:
         """
-        根据夹爪跳变量生成插值后的动作序列
-
-        参考: template.py 的 generate_trajectory
-
-        当夹爪跳变较大时，扩展动作步数以实现平滑过渡。
-        机械臂和夹爪都进行线性插值，在整个轨迹上均匀重新采样。
+        判断是否需要插值及所需步数
 
         Args:
             actions: 原始动作序列 (N, 7)
+            current_state: 当前实际状态 (7,)
+
+        Returns:
+            (是否需要插值, 总步数)
+        """
+        if len(actions) == 0:
+            return False, 0
+
+        # 计算差距
+        first_action = actions[0]
+        diffs = np.abs(first_action - current_state)
+
+        # 各维度所需步数
+        steps_needed = np.ceil(diffs / self.step_lengths).astype(int)
+        steps_needed = np.maximum(steps_needed, 1)
+
+        # 总步数
+        max_dim_steps = np.max(steps_needed)
+        total_steps = max(max_dim_steps, len(actions))
+
+        needs_interpolation = total_steps > len(actions)
+
+        if needs_interpolation:
+            # 记录触发维度
+            dim_names = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'gripper']
+            triggers = [f"{dim_names[i]}={diffs[i]:.1f}"
+                       for i in range(7) if steps_needed[i] == max_dim_steps]
+            logging.info(f"触发插值: {', '.join(triggers)} | {len(actions)}步→{total_steps}步")
+
+        return needs_interpolation, total_steps
+
+    def _generate_interpolated_actions(
+        self,
+        actions: np.ndarray,
+        current_state: np.ndarray
+    ) -> np.ndarray:
+        """
+        基于物理约束的多维度轨迹插值
+
+        参考: template.py 的 generate_trajectory
+
+        当任一维度跳变超过step_length时，扩展动作步数以实现平滑过渡。
+        所有维度都进行线性插值，在整个轨迹上均匀重新采样。
+
+        Args:
+            actions: 原始动作序列 (N, 7)
+            current_state: 当前实际状态 (7,)
 
         Returns:
             插值后的动作序列，步数可能大于原始 N
@@ -1065,60 +1006,39 @@ class InferenceClient:
         if len(actions) == 0:
             return actions
 
-        # 获取第一个动作的夹爪目标值
-        first_gripper = float(actions[0, 6])
+        # 判断是否需要插值
+        needs_interpolation, total_steps = self._should_interpolate(actions, current_state)
 
-        # 计算夹爪跳变
-        if self.last_gripper_value is not None:
-            gripper_jump = abs(first_gripper - self.last_gripper_value)
-        else:
-            gripper_jump = 0
-
-        # 计算夹爪需要的步数
-        gripper_steps = max(1, int(np.ceil(gripper_jump / self.gripper_step_length)))
-
-        # 原始步数
-        original_steps = len(actions)
-
-        # 总步数取最大值
-        total_steps = max(original_steps, gripper_steps)
-
-        if total_steps == original_steps:
-            # 无需插值，直接返回原始动作
+        if not needs_interpolation:
             return actions
 
-        # 需要插值：生成新的动作序列
-        logging.info(f"夹爪跳变 {gripper_jump:.0f}，扩展动作从 {original_steps} 步到 {total_steps} 步")
-
+        # 执行插值
+        original_steps = len(actions)
         interpolated = np.zeros((total_steps, 7), dtype=np.float32)
-        start_gripper = self.last_gripper_value if self.last_gripper_value is not None else first_gripper
-        target_gripper = float(actions[-1, 6])  # 最终夹爪目标
 
         for step in range(total_steps):
-            # === 方案3：在整个轨迹上重新采样 ===
-            # 计算当前步对应原始轨迹的位置
             if total_steps == 1:
-                progress = 0
+                progress = 1.0
             else:
-                progress = step / (total_steps - 1) * (original_steps - 1)
+                progress = step / (total_steps - 1)
 
-            # 找到相邻的两个原始动作
-            idx_low = int(np.floor(progress))
-            idx_high = min(idx_low + 1, original_steps - 1)
-            alpha = progress - idx_low  # 插值系数 [0, 1]
-
-            # 机械臂位姿：线性插值
-            if idx_high == idx_low:
-                arm_pose = actions[idx_low, :6]
+            if progress == 0:
+                # 第一步：当前状态
+                interpolated[step] = current_state
             else:
-                arm_pose = actions[idx_low, :6] * (1 - alpha) + actions[idx_high, :6] * alpha
+                # 在原始动作序列中插值
+                action_progress = progress * (original_steps - 1)
+                idx_low = int(np.floor(action_progress))
+                idx_high = min(idx_low + 1, original_steps - 1)
+                alpha = action_progress - idx_low
 
-            # 夹爪：全局线性插值（从上次值到最终目标）
-            progress_global = (step + 1) / total_steps
-            gripper_value = start_gripper + progress_global * (target_gripper - start_gripper)
-
-            interpolated[step, :6] = arm_pose
-            interpolated[step, 6] = gripper_value
+                if idx_high == idx_low:
+                    interpolated[step] = actions[idx_low]
+                else:
+                    interpolated[step] = (
+                        actions[idx_low] * (1 - alpha) +
+                        actions[idx_high] * alpha
+                    )
 
         return interpolated
 
@@ -1158,13 +1078,21 @@ class InferenceClient:
                 self.current_inference_step = self.perf_stats['inference_count']
                 self.current_action_index = 0
 
-                # 取前 replan_steps 个动作，并根据夹爪跳变进行插值
+                # 取前 replan_steps 个动作
                 original_actions = actions[:min(self.args.replan_steps, len(actions))]
-                interpolated_actions = self._generate_interpolated_actions(original_actions)
 
-                # 更新上次夹爪值
-                if len(interpolated_actions) > 0:
-                    self.last_gripper_value = float(interpolated_actions[-1, 6])
+                # 获取当前实际状态
+                current_state = self._get_current_state()
+
+                # 基于当前状态进行插值
+                if current_state is not None:
+                    interpolated_actions = self._generate_interpolated_actions(
+                        original_actions,
+                        current_state
+                    )
+                else:
+                    # 降级：使用原始动作
+                    interpolated_actions = original_actions
 
                 # 填充动作队列
                 for i in range(len(interpolated_actions)):
@@ -1211,12 +1139,12 @@ class InferenceClient:
             )
 
         # 获取当前机械臂状态（用于记录）
-        current_pose = None
-        if self.node.state_buffer:
-            _, current_pose = self.node.state_buffer[-1]
+        current_pose = self.node.robot_state
 
-        # 获取当前夹爪状态
-        gripper_state = self.gripper_target_pos[0]  # 使用目标位置作为近似
+        # 获取当前夹爪状态（使用实际反馈）
+        gripper_state = self.gripper_feedback.current_real_pos
+        if gripper_state is None:
+            gripper_state = self.gripper_target_pos[0]
 
         # 记录数据
         if self.data_logger is not None and current_pose is not None:
@@ -1232,7 +1160,7 @@ class InferenceClient:
                 current_pose=current_pose,
                 gripper_state=gripper_state,
                 target_pose=np.array(target_pose, dtype=np.float32),
-                image_timestamp=self.current_image_timestamp,
+                image_timestamp=time.time(),  # 使用当前时间作为时间戳
             )
 
         if self.args.dry_run:
@@ -1285,28 +1213,24 @@ class InferenceClient:
 
         self.inference_enabled = True
         start_time = time.time()
-        last_timestamp = None
+
+        # 30Hz 速率控制
+        target_dt = 1.0 / 30.0  # 33.3ms per step
+        last_step_time = time.time()
 
         try:
             while self.inference_enabled and self.step_count < self.args.max_steps:
-                loop_start = time.time()
-
-                # 检查是否有新图像
-                if not self.node.image_buffer:
-                    time.sleep(0.001)
-                    continue
-
-                latest_timestamp, _ = self.node.image_buffer[-1]
-                if latest_timestamp == last_timestamp:
-                    time.sleep(0.001)
-                    continue
-
-                last_timestamp = latest_timestamp
-                self.current_image_timestamp = latest_timestamp  # 保存图像时间戳用于帧间隔记录
+                # 速率控制: 确保至少间隔 33.3ms
+                current_time = time.time()
+                elapsed = current_time - last_step_time
+                if elapsed < target_dt:
+                    time.sleep(target_dt - elapsed)
+                last_step_time = time.time()
 
                 # 构建观测
                 obs = self._build_observation()
                 if obs is None:
+                    time.sleep(0.001)
                     continue
 
                 # 获取动作
