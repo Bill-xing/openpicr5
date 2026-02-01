@@ -511,34 +511,7 @@ class InferenceLogAnalyzer:
         target_poses = target_poses[:min_len]
         current_poses = current_poses[:min_len]
 
-        # 绘制 3D 轨迹
-        fig = plt.figure(figsize=(12, 10))
-        ax = fig.add_subplot(111, projection='3d')
-
-        # 目标轨迹
-        ax.plot(target_poses[:, 0], target_poses[:, 1], target_poses[:, 2],
-                'b-', label='Target', alpha=0.7, linewidth=1)
-        # 实际轨迹
-        ax.plot(current_poses[:, 0], current_poses[:, 1], current_poses[:, 2],
-                'r-', label='Actual', alpha=0.7, linewidth=1)
-
-        # 标记起点和终点
-        ax.scatter(*target_poses[0, :3], color='green', s=100, marker='o', label='Start')
-        ax.scatter(*target_poses[-1, :3], color='purple', s=100, marker='s', label='End')
-
-        ax.set_xlabel('X (mm)')
-        ax.set_ylabel('Y (mm)')
-        ax.set_zlabel('Z (mm)')
-        ax.set_title('Target vs Actual Trajectory (3D)')
-        ax.legend()
-
-        plt.tight_layout()
-        fig_path = self.output_dir / 'trajectory_3d.png'
-        fig.savefig(fig_path, dpi=150)
-        self.figures['trajectory_3d'] = fig
-        print(f"  图表已保存: {fig_path}")
-
-        # 绘制各轴对比图
+        # 只绘制各轴对比图
         fig, axes = plt.subplots(3, 1, figsize=(14, 10))
         steps = np.arange(min_len)
         axis_labels = ['X', 'Y', 'Z']
@@ -769,13 +742,8 @@ class InferenceLogAnalyzer:
 
     def run_all_analysis(self):
         """运行所有分析"""
-        self.analyze_tracking_error()
-        self.analyze_action_continuity()
-        self.analyze_by_action_index()
-        self.analyze_inference_latency()
-        self.analyze_frame_rate()
+        # 只生成轨迹图
         self.analyze_trajectory()
-        self.generate_html_report()
 
         print(f"\n=== 分析完成 ===")
         print(f"输出目录: {self.output_dir}")

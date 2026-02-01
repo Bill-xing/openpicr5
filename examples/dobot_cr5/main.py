@@ -36,6 +36,7 @@ import re
 import threading
 import time
 from collections import deque
+from typing import Union
 
 import cv2
 import h5py
@@ -60,6 +61,7 @@ from dobot_msgs_v3.srv import (
     ModbusClose,
     ModbusCreate,
     ServoP,
+    ServoPNoWait,
     SetHoldRegs,
     SpeedFactor,
 )
@@ -78,7 +80,7 @@ class Args:
     host: str = "localhost"  # 策略服务器地址
     port: int = 8000  # 策略服务器端口
     resize_size: int = 224  # 图像尺寸（策略模型期望的图像大小）
-    replan_steps: int = 5  # 重新规划步数：每执行N步动作后重新调用策略推理
+    replan_steps: int = 10  # 重新规划步数：每执行N步动作后重新调用策略推理（增加到10以扩展运动范围）
 
     # 任务参数
     prompt: str = "pick up the object"  # 任务描述
@@ -86,7 +88,8 @@ class Args:
     # 执行参数
     max_steps: int = 500  # 最大执行步数
     dry_run: bool = False  # 空运行模式：只打印动作，不执行
-    blocking_servo: bool = True  # 阻塞执行模式：等待 ServoP 服务调用完成
+    blocking_servo: Union[bool, str] = 'last_blocking'  # 阻塞执行模式：'last_blocking'=最后一个动作阻塞，'hybrid'=Index0阻塞，True=全阻塞，False=全非阻塞
+    observation_delay_ms: int = 0  # 观测前延迟(ms)，等待ServoP部分完成再读取状态
 
     # 数据记录参数
     record: bool = False  # 是否启用数据记录
@@ -347,6 +350,9 @@ class DobotRosWrapper(Node):
             SpeedFactor, "/dobot_bringup_v3/srv/SpeedFactor"
         )
         self.cli_servo_p = self.create_client(ServoP, "/dobot_bringup_v3/srv/ServoP")
+        self.cli_servo_p_no_wait = self.create_client(
+            ServoPNoWait, "/dobot_bringup_v3/srv/ServoPNoWait"
+        )
         self.cli_get_pose = self.create_client(GetPose, "/dobot_bringup_v3/srv/GetPose")
 
         # === Modbus通信服务客户端（用于夹爪控制）===
@@ -1081,22 +1087,10 @@ class InferenceClient:
                 # 取前 replan_steps 个动作
                 original_actions = actions[:min(self.args.replan_steps, len(actions))]
 
-                # 获取当前实际状态
-                current_state = self._get_current_state()
-
-                # 基于当前状态进行插值
-                if current_state is not None:
-                    interpolated_actions = self._generate_interpolated_actions(
-                        original_actions,
-                        current_state
-                    )
-                else:
-                    # 降级：使用原始动作
-                    interpolated_actions = original_actions
-
+                # 严格执行推理服务端结果，不插值
                 # 填充动作队列
-                for i in range(len(interpolated_actions)):
-                    self.action_queue.append(interpolated_actions[i])
+                for i in range(len(original_actions)):
+                    self.action_queue.append(original_actions[i])
 
             except Exception as e:
                 logging.error(f"Inference failed: {e}")
@@ -1138,6 +1132,9 @@ class InferenceClient:
                 f"Action[{self.step_count}]: gripper_raw={gripper_raw:.1f}, gripper_target={gripper_target}"
             )
 
+        # DEBUG: 性能分析
+        t_data_prep = time.time()
+
         # 获取当前机械臂状态（用于记录）
         current_pose = self.node.robot_state
 
@@ -1145,6 +1142,8 @@ class InferenceClient:
         gripper_state = self.gripper_feedback.current_real_pos
         if gripper_state is None:
             gripper_state = self.gripper_target_pos[0]
+
+        t_logging = time.time()
 
         # 记录数据
         if self.data_logger is not None and current_pose is not None:
@@ -1163,18 +1162,70 @@ class InferenceClient:
                 image_timestamp=time.time(),  # 使用当前时间作为时间戳
             )
 
+        t_servo_prep = time.time()
+
         if self.args.dry_run:
             logging.info(f"[DRY RUN] pose={target_pose}, gripper={gripper_target}")
             return
 
-        # 发送ServoP指令
-        self.ServoP(*target_pose)
+        # 发送ServoP指令（支持hybrid模式）
+        req = ServoP.Request()
+        req.x, req.y, req.z = float(target_pose[0]), float(target_pose[1]), float(target_pose[2])
+        req.rx, req.ry, req.rz = float(target_pose[3]), float(target_pose[4]), float(target_pose[5])
+
+        # ServoPNoWait请求（相同参数）
+        req_no_wait = ServoPNoWait.Request()
+        req_no_wait.x, req_no_wait.y, req_no_wait.z = req.x, req.y, req.z
+        req_no_wait.rx, req_no_wait.ry, req_no_wait.rz = req.rx, req.ry, req.rz
+
+        t_servo_call = time.time()
+
+        if self.args.blocking_servo == 'last_blocking':
+            # last_blocking模式：只有最后一个动作阻塞
+            if action_index == self.args.replan_steps - 1:
+                # 最后一个动作：阻塞等待，确保所有动作执行完成
+                self.node.call_service(self.node.cli_servo_p, req)
+            else:
+                # 前面的动作：使用真正的ServoPNoWait
+                self.node.call_service_async_no_wait(self.node.cli_servo_p_no_wait, req_no_wait)
+        elif self.args.blocking_servo == 'hybrid':
+            # 混合模式: Index 0阻塞，其他非阻塞
+            if action_index == 0:
+                # 首帧阻塞，确保状态对齐
+                self.node.call_service(self.node.cli_servo_p, req)
+            else:
+                # 后续帧非阻塞，使用ServoPNoWait
+                self.node.call_service_async_no_wait(self.node.cli_servo_p_no_wait, req_no_wait)
+        elif self.args.blocking_servo:
+            # 全阻塞模式
+            self.node.call_service(self.node.cli_servo_p, req)
+        else:
+            # 全非阻塞模式：使用真正的ServoPNoWait
+            self.node.call_service_async_no_wait(self.node.cli_servo_p_no_wait, req_no_wait)
+
+        t_publish = time.time()
 
         # 发布目标位姿话题
         self.publish_robot_target(target_pose)
 
+        t_gripper = time.time()
+
         # 设置夹爪目标
         self.set_gripper(gripper_target)
+
+        t_end = time.time()
+
+        # DEBUG: 每30步打印一次详细性能
+        if self.step_count % 30 == 29:
+            logging.info(
+                f"  [execute_action细节] "
+                f"数据准备:{(t_logging-t_data_prep)*1000:.1f}ms | "
+                f"记录:{(t_servo_prep-t_logging)*1000:.1f}ms | "
+                f"ServoP准备:{(t_servo_call-t_servo_prep)*1000:.1f}ms | "
+                f"ServoP调用:{(t_publish-t_servo_call)*1000:.1f}ms | "
+                f"发布话题:{(t_gripper-t_publish)*1000:.1f}ms | "
+                f"夹爪:{(t_end-t_gripper)*1000:.1f}ms"
+            )
 
     def run(self):
         """
@@ -1214,34 +1265,61 @@ class InferenceClient:
         self.inference_enabled = True
         start_time = time.time()
 
-        # 30Hz 速率控制
+        # === 性能分析变量 ===
+        perf_times = {
+            'build_obs': deque(maxlen=100),
+            'get_action': deque(maxlen=100),
+            'execute_action': deque(maxlen=100),
+            'total_loop': deque(maxlen=100),
+        }
+
+        # === 30Hz速率控制（仅在非ServoPNoWait模式启用）===
+        # 当使用ServoPNoWait时，应该让系统以自然最快速度运行
+        # 速率由控制器端的执行速度自然限制
+        use_rate_limit = (self.args.blocking_servo not in [False, 'hybrid'])
         target_dt = 1.0 / 30.0  # 33.3ms per step
         last_step_time = time.time()
 
         try:
             while self.inference_enabled and self.step_count < self.args.max_steps:
-                # 速率控制: 确保至少间隔 33.3ms
-                current_time = time.time()
-                elapsed = current_time - last_step_time
-                if elapsed < target_dt:
-                    time.sleep(target_dt - elapsed)
-                last_step_time = time.time()
+                loop_start = time.time()
+
+                # 速率控制: 仅在阻塞模式下使用
+                if use_rate_limit:
+                    current_time = time.time()
+                    elapsed = current_time - last_step_time
+                    if elapsed < target_dt:
+                        time.sleep(target_dt - elapsed)
+                    last_step_time = time.time()
+
+                # 观测延迟：等待ServoP部分完成再读取状态
+                # 注意：在ServoPNoWait模式下，这个延迟需要精细调整
+                if self.args.observation_delay_ms > 0:
+                    time.sleep(self.args.observation_delay_ms / 1000.0)
 
                 # 构建观测
+                t0 = time.time()
                 obs = self._build_observation()
+                perf_times['build_obs'].append((time.time() - t0) * 1000)
                 if obs is None:
                     time.sleep(0.001)
                     continue
 
                 # 获取动作
+                t0 = time.time()
                 action_result = self._get_action(obs)
+                perf_times['get_action'].append((time.time() - t0) * 1000)
                 if action_result is None:
                     continue
 
                 action, action_index, inference_step = action_result
 
                 # 执行动作
+                t0 = time.time()
                 self._execute_action(action, action_index, inference_step)
+                perf_times['execute_action'].append((time.time() - t0) * 1000)
+
+                perf_times['total_loop'].append((time.time() - loop_start) * 1000)
                 self.step_count += 1
 
                 # 打印进度（每30帧）
@@ -1259,6 +1337,12 @@ class InferenceClient:
                     else:
                         inf_mean = inf_max = 0
 
+                    # 性能分析统计
+                    perf_str = " | ".join([
+                        f"{k}: {np.mean(list(v)):.1f}ms"
+                        for k, v in perf_times.items() if v
+                    ])
+
                     logging.info(
                         f"Step {self.step_count} | "
                         f"动作频率: {action_fps:.1f}Hz (目标30) | "
@@ -1266,6 +1350,7 @@ class InferenceClient:
                         f"推理延迟: {inf_mean:.0f}ms (max:{inf_max:.0f}ms) | "
                         f"队列: {len(self.action_queue)}"
                     )
+                    logging.info(f"  性能: {perf_str}")
 
             logging.info(f"\n=== 推理完成 ===")
             logging.info(f"总步数: {self.step_count}")
