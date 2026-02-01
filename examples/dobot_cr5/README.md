@@ -80,7 +80,7 @@ source /home/xing/openpi-main/dobot_ws/install/setup.bash
 python examples/dobot_cr5/main.py \
     --host localhost \
     --port 8000 \
-    --prompt "pick up the red block"
+    --prompt "Pick up the red block and place it on the plate"
 ```
 
 ## 命令行参数
