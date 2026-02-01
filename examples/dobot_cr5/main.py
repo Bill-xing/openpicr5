@@ -30,13 +30,16 @@ python examples/dobot_cr5/main.py --host localhost --port 8000 --prompt "pick up
 
 import bisect
 import dataclasses
+from datetime import datetime
 import logging
+import pathlib
 import re
 import threading
 import time
 from collections import deque
 
 import cv2
+import h5py
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
@@ -84,6 +87,226 @@ class Args:
     # 执行参数
     max_steps: int = 1000  # 最大执行步数
     dry_run: bool = False  # 空运行模式：只打印动作，不执行
+
+    # 数据记录参数
+    record: bool = False  # 是否启用数据记录
+    record_dir: str = "./inference_logs"  # 记录数据保存目录
+    record_images: bool = False  # 是否记录图像（禁用可显著提升性能）
+
+
+class DataLogger:
+    """
+    数据记录器（优化版）
+
+    记录推理过程中的三类数据：
+    1. 推理结果：模型输出的动作序列和输入图像
+    2. 发送命令：实际发送给机械臂的 ServoP 命令
+    3. 机械臂状态：机械臂实时位姿反馈
+
+    用于分析 VLA 控制晃动问题，定位是模型推理问题还是推理客户端问题。
+
+    优化措施：
+    - 使用 Python 原生类型存储，仅在保存时转换为 numpy
+    - 使用预分配列表减少内存分配
+    - 可选禁用图像记录以减少开销
+    """
+
+    def __init__(self, record_dir: str, args: Args):
+        """
+        初始化数据记录器
+
+        Args:
+            record_dir: 记录数据保存目录
+            args: 命令行参数配置
+        """
+        self.record_dir = pathlib.Path(record_dir)
+        self.record_dir.mkdir(parents=True, exist_ok=True)
+        self.args = args
+        self.record_images = args.record_images  # 是否记录图像
+
+        # 生成文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.filename = self.record_dir / f"inference_log_{timestamp}.h5"
+
+        # 推理记录缓冲区（低频，约 6Hz）
+        self.inference_data = {
+            "timestamps": [],
+            "steps": [],
+            "obs_images": [],  # 仅当 record_images=True 时记录
+            "obs_states": [],
+            "actions": [],
+            "latencies_ms": [],
+        }
+
+        # 命令记录缓冲区（30Hz）- 使用 Python 原生类型
+        self.command_data = {
+            "timestamps": [],
+            "target_poses": [],  # 存储为 tuple，保存时转换
+            "gripper_targets": [],
+            "action_indices": [],
+            "inference_steps": [],
+        }
+
+        # 机械臂状态记录缓冲区（30Hz）- 使用 Python 原生类型
+        self.robot_state_data = {
+            "timestamps": [],
+            "current_poses": [],  # 存储为 tuple，保存时转换
+            "gripper_states": [],
+            "pose_errors": [],    # 存储为 tuple，保存时转换
+            "frame_intervals_ms": [],
+        }
+
+        # 推理计数器
+        self.inference_count = 0
+        self.last_command_time = None  # 用于计算帧间隔
+
+        logging.info(f"[DataLogger] 初始化完成, 保存路径: {self.filename}")
+        logging.info(f"[DataLogger] 图像记录: {'启用' if self.record_images else '禁用'}")
+
+    def log_inference(
+        self,
+        step: int,
+        obs_image: np.ndarray,
+        obs_state: np.ndarray,
+        actions: np.ndarray,
+        latency_ms: float,
+    ):
+        """
+        记录推理调用
+
+        Args:
+            step: 当前执行步数
+            obs_image: 输入图像 (224, 224, 3)
+            obs_state: 输入状态 (7,)
+            actions: 推理输出动作 (horizon, 7)
+            latency_ms: 推理延迟 (毫秒)
+        """
+        self.inference_data["timestamps"].append(time.time())
+        self.inference_data["steps"].append(step)
+        # 仅当启用图像记录时才复制图像
+        if self.record_images:
+            self.inference_data["obs_images"].append(obs_image.copy())
+        self.inference_data["obs_states"].append(obs_state.copy())
+        self.inference_data["actions"].append(actions.copy())
+        self.inference_data["latencies_ms"].append(latency_ms)
+        self.inference_count += 1
+
+    def log_command(
+        self,
+        target_pose: np.ndarray,
+        gripper_target: float,
+        action_index: int,
+        inference_step: int,
+    ):
+        """
+        记录发送给机械臂的命令（优化版：避免 numpy 数组创建）
+
+        Args:
+            target_pose: 目标位姿 (6,) [x,y,z,rx,ry,rz]
+            gripper_target: 夹爪目标位置 [0-1000]
+            action_index: 当前执行的是第几个动作 (0~replan_steps-1)
+            inference_step: 该动作来自哪次推理
+        """
+        self.command_data["timestamps"].append(time.time())
+        # 使用 tuple 存储，避免创建 numpy 数组
+        self.command_data["target_poses"].append(tuple(target_pose))
+        self.command_data["gripper_targets"].append(float(gripper_target))
+        self.command_data["action_indices"].append(int(action_index))
+        self.command_data["inference_steps"].append(int(inference_step))
+
+    def log_robot_state(
+        self,
+        current_pose: np.ndarray,
+        gripper_state: float,
+        target_pose: np.ndarray,
+    ):
+        """
+        记录机械臂实时状态（优化版：避免 numpy 数组创建）
+
+        Args:
+            current_pose: 当前位姿 (6,) [x,y,z,rx,ry,rz]
+            gripper_state: 夹爪当前位置
+            target_pose: 目标位姿 (6,)，用于计算跟踪误差
+        """
+        current_time = time.time()
+        self.robot_state_data["timestamps"].append(current_time)
+        # 使用 tuple 存储，避免创建 numpy 数组
+        self.robot_state_data["current_poses"].append(tuple(current_pose))
+        self.robot_state_data["gripper_states"].append(float(gripper_state))
+
+        # 计算跟踪误差（使用列表推导式，避免 numpy 开销）
+        pose_error = tuple(float(t - c) for t, c in zip(target_pose, current_pose))
+        self.robot_state_data["pose_errors"].append(pose_error)
+
+        # 计算帧间隔
+        if self.last_command_time is not None:
+            frame_interval_ms = (current_time - self.last_command_time) * 1000
+        else:
+            frame_interval_ms = 33.3  # 默认30Hz
+        self.robot_state_data["frame_intervals_ms"].append(frame_interval_ms)
+        self.last_command_time = current_time
+
+    def save(self):
+        """保存数据到 HDF5 文件"""
+        if not self.inference_data["timestamps"]:
+            logging.warning("[DataLogger] 没有数据可保存")
+            return
+
+        logging.info(f"[DataLogger] 保存数据到 {self.filename}")
+        logging.info(f"  - 推理次数: {len(self.inference_data['timestamps'])}")
+        logging.info(f"  - 命令次数: {len(self.command_data['timestamps'])}")
+        logging.info(f"  - 状态次数: {len(self.robot_state_data['timestamps'])}")
+
+        with h5py.File(self.filename, "w") as f:
+            # 保存元数据
+            meta = f.create_group("metadata")
+            meta.create_dataset("prompt", data=self.args.prompt)
+            meta.create_dataset("host", data=self.args.host)
+            meta.create_dataset("port", data=self.args.port)
+            meta.create_dataset("replan_steps", data=self.args.replan_steps)
+            meta.create_dataset("resize_size", data=self.args.resize_size)
+
+            # 保存推理数据
+            inf = f.create_group("inference")
+            inf.create_dataset("timestamps", data=np.array(self.inference_data["timestamps"]))
+            inf.create_dataset("steps", data=np.array(self.inference_data["steps"]))
+            if self.inference_data["obs_images"]:
+                inf.create_dataset(
+                    "obs_images",
+                    data=np.stack(self.inference_data["obs_images"]),
+                    compression="gzip",
+                    compression_opts=4,
+                )
+            if self.inference_data["obs_states"]:
+                inf.create_dataset("obs_states", data=np.stack(self.inference_data["obs_states"]))
+            if self.inference_data["actions"]:
+                inf.create_dataset("actions", data=np.stack(self.inference_data["actions"]))
+            inf.create_dataset("latencies_ms", data=np.array(self.inference_data["latencies_ms"]))
+
+            # 保存命令数据
+            cmd = f.create_group("commands")
+            cmd.create_dataset("timestamps", data=np.array(self.command_data["timestamps"]))
+            if self.command_data["target_poses"]:
+                cmd.create_dataset("target_poses", data=np.stack(self.command_data["target_poses"]))
+            cmd.create_dataset("gripper_targets", data=np.array(self.command_data["gripper_targets"]))
+            cmd.create_dataset("action_indices", data=np.array(self.command_data["action_indices"]))
+            cmd.create_dataset("inference_steps", data=np.array(self.command_data["inference_steps"]))
+
+            # 保存机械臂状态数据
+            state = f.create_group("robot_states")
+            state.create_dataset("timestamps", data=np.array(self.robot_state_data["timestamps"]))
+            if self.robot_state_data["current_poses"]:
+                state.create_dataset("current_poses", data=np.stack(self.robot_state_data["current_poses"]))
+            state.create_dataset("gripper_states", data=np.array(self.robot_state_data["gripper_states"]))
+            if self.robot_state_data["pose_errors"]:
+                state.create_dataset("pose_errors", data=np.stack(self.robot_state_data["pose_errors"]))
+            state.create_dataset("frame_intervals_ms", data=np.array(self.robot_state_data["frame_intervals_ms"]))
+
+        logging.info(f"[DataLogger] 数据保存完成: {self.filename}")
+
+    def close(self):
+        """清理资源"""
+        self.save()
 
 
 class DobotRosWrapper(Node):
@@ -553,12 +776,22 @@ class InferenceClient:
             'last_inference_time': None,             # 上次推理时间戳
         }
 
+        # 数据记录器
+        self.data_logger = None
+        if args.record:
+            self.data_logger = DataLogger(args.record_dir, args)
+
+        # 动作队列跟踪（用于记录）
+        self.current_action_index = 0  # 当前执行的动作在队列中的索引
+        self.current_inference_step = 0  # 当前动作来自哪次推理
+
         logging.info("=== 推理客户端初始化完成 ===")
         logging.info(f"策略服务器: {args.host}:{args.port}")
         logging.info(f"任务提示: {args.prompt}")
         logging.info(f"重规划步数: {args.replan_steps}")
         logging.info(f"最大步数: {args.max_steps}")
         logging.info(f"空运行模式: {args.dry_run}")
+        logging.info(f"数据记录: {args.record}")
 
     def _enable_robot(self):
         """使能机器人"""
@@ -822,6 +1055,20 @@ class InferenceClient:
 
                 actions = result["actions"]
 
+                # 记录推理结果
+                if self.data_logger is not None:
+                    self.data_logger.log_inference(
+                        step=self.step_count,
+                        obs_image=obs["observation/image"],
+                        obs_state=obs["observation/state"],
+                        actions=actions,
+                        latency_ms=inference_time * 1000,
+                    )
+
+                # 更新推理步数计数器
+                self.current_inference_step = self.perf_stats['inference_count']
+                self.current_action_index = 0
+
                 # 只取前replan_steps个动作
                 for i in range(min(self.args.replan_steps, len(actions))):
                     self.action_queue.append(actions[i])
@@ -831,11 +1078,23 @@ class InferenceClient:
                 return None
 
         if self.action_queue:
-            return self.action_queue.popleft()
+            action = self.action_queue.popleft()
+            # 更新动作索引（从当前推理批次中的第几个动作）
+            action_index = self.current_action_index
+            self.current_action_index += 1
+            # 返回动作和索引信息
+            return action, action_index, self.current_inference_step
         return None
 
-    def _execute_action(self, action: np.ndarray):
-        """执行动作"""
+    def _execute_action(self, action: np.ndarray, action_index: int, inference_step: int):
+        """
+        执行动作并记录
+
+        Args:
+            action: 动作向量 (7,) [x,y,z,rx,ry,rz,gripper]
+            action_index: 当前执行的是第几个动作 (0~replan_steps-1)
+            inference_step: 该动作来自哪次推理
+        """
         # action: (7,) [x,y,z,rx,ry,rz,gripper]
         target_pose = [
             float(action[0]),
@@ -852,6 +1111,30 @@ class InferenceClient:
         if self.step_count % 100 == 0:
             logging.info(
                 f"Action[{self.step_count}]: gripper_raw={gripper_raw:.1f}, gripper_target={gripper_target}"
+            )
+
+        # 获取当前机械臂状态（用于记录）
+        current_pose = None
+        if self.node.state_buffer:
+            _, current_pose = self.node.state_buffer[-1]
+
+        # 获取当前夹爪状态
+        gripper_state = self.gripper_target_pos[0]  # 使用目标位置作为近似
+
+        # 记录数据
+        if self.data_logger is not None and current_pose is not None:
+            # 记录发送的命令
+            self.data_logger.log_command(
+                target_pose=np.array(target_pose, dtype=np.float32),
+                gripper_target=gripper_target,
+                action_index=action_index,
+                inference_step=inference_step,
+            )
+            # 记录机械臂状态
+            self.data_logger.log_robot_state(
+                current_pose=current_pose,
+                gripper_state=gripper_state,
+                target_pose=np.array(target_pose, dtype=np.float32),
             )
 
         if self.args.dry_run:
@@ -928,12 +1211,14 @@ class InferenceClient:
                     continue
 
                 # 获取动作
-                action = self._get_action(obs)
-                if action is None:
+                action_result = self._get_action(obs)
+                if action_result is None:
                     continue
 
+                action, action_index, inference_step = action_result
+
                 # 执行动作
-                self._execute_action(action)
+                self._execute_action(action, action_index, inference_step)
                 self.step_count += 1
 
                 # 打印进度（每30帧）
@@ -966,6 +1251,10 @@ class InferenceClient:
         except KeyboardInterrupt:
             logging.info("\n\n=== 推理被中断 ===")
 
+        # 保存记录数据
+        if self.data_logger is not None:
+            self.data_logger.save()
+
         # 等待夹爪到达最终位置
         logging.info("等待夹爪到达最终位置...")
         time.sleep(1.0)
@@ -977,10 +1266,16 @@ class InferenceClient:
         步骤：
         1. 停止夹爪状态反馈线程
         2. 等待线程结束
-        3. 关闭ROS节点
+        3. 关闭数据记录器
+        4. 关闭ROS节点
         """
         self.gripper_feedback.running = False
         self.gripper_feedback.join(timeout=1.0)
+
+        # 关闭数据记录器（会自动保存未保存的数据）
+        if self.data_logger is not None:
+            self.data_logger.close()
+
         self.node.destroy_node()
         rclpy.shutdown()
 

@@ -192,3 +192,10 @@ src/openpi/lerobot_dataset/videos/observation.images.top/chunk-000/episode_00000
 my_data/*
 dataset_player.py
 recorder_optimized.py
+data_collector4.py
+.gitignore
+inference_logs/*
+inference_logs/inference_log_20260201_204652.h5
+inference_logs/inference_log_20260201_204857.h5
+inference_logs/inference_log_20260201_205009.h5
+analysis_results/*
