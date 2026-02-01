@@ -122,3 +122,5 @@ ros2 topic hz /robot/target_pose  # 应该约30Hz
 | 状态维度 | 7D (6D位姿+1D夹爪) | 7D |
 | 动作维度 | 7D (6D位姿+1D夹爪) | 7D |
 | 夹爪范围 | 0-1 (归一化) | 0-1 (归一化) |
+# 分析结果
+python examples/dobot_cr5/analyze_inference_log.py        inference_logs/inference_log_20260201_211013.h5 

@@ -87,6 +87,7 @@ class Args:
     # 执行参数
     max_steps: int = 1000  # 最大执行步数
     dry_run: bool = False  # 空运行模式：只打印动作，不执行
+    blocking_servo: bool = False  # 阻塞执行模式：等待 ServoP 服务调用完成
 
     # 数据记录参数
     record: bool = False  # 是否启用数据记录
@@ -158,7 +159,7 @@ class DataLogger:
 
         # 推理计数器
         self.inference_count = 0
-        self.last_command_time = None  # 用于计算帧间隔
+        self.last_image_timestamp = None  # 用于计算帧间隔（使用图像时间戳）
 
         logging.info(f"[DataLogger] 初始化完成, 保存路径: {self.filename}")
         logging.info(f"[DataLogger] 图像记录: {'启用' if self.record_images else '禁用'}")
@@ -219,6 +220,7 @@ class DataLogger:
         current_pose: np.ndarray,
         gripper_state: float,
         target_pose: np.ndarray,
+        image_timestamp: float,
     ):
         """
         记录机械臂实时状态（优化版：避免 numpy 数组创建）
@@ -227,6 +229,7 @@ class DataLogger:
             current_pose: 当前位姿 (6,) [x,y,z,rx,ry,rz]
             gripper_state: 夹爪当前位置
             target_pose: 目标位姿 (6,)，用于计算跟踪误差
+            image_timestamp: 图像时间戳，用于计算帧间隔
         """
         current_time = time.time()
         self.robot_state_data["timestamps"].append(current_time)
@@ -238,13 +241,13 @@ class DataLogger:
         pose_error = tuple(float(t - c) for t, c in zip(target_pose, current_pose))
         self.robot_state_data["pose_errors"].append(pose_error)
 
-        # 计算帧间隔
-        if self.last_command_time is not None:
-            frame_interval_ms = (current_time - self.last_command_time) * 1000
+        # 使用图像时间戳计算帧间隔（反映真实的图像到达间隔）
+        if self.last_image_timestamp is not None:
+            frame_interval_ms = (image_timestamp - self.last_image_timestamp) * 1000
         else:
             frame_interval_ms = 33.3  # 默认30Hz
         self.robot_state_data["frame_intervals_ms"].append(frame_interval_ms)
-        self.last_command_time = current_time
+        self.last_image_timestamp = image_timestamp
 
     def save(self):
         """保存数据到 HDF5 文件"""
@@ -784,6 +787,7 @@ class InferenceClient:
         # 动作队列跟踪（用于记录）
         self.current_action_index = 0  # 当前执行的动作在队列中的索引
         self.current_inference_step = 0  # 当前动作来自哪次推理
+        self.current_image_timestamp = None  # 当前图像时间戳（用于帧间隔记录）
 
         logging.info("=== 推理客户端初始化完成 ===")
         logging.info(f"策略服务器: {args.host}:{args.port}")
@@ -831,7 +835,7 @@ class InferenceClient:
         """
         发送ServoP伺服运动指令
 
-        异步发送，不等待执行结果，以保证高频控制不被阻塞。
+        根据 args.blocking_servo 决定是否阻塞等待执行完成。
 
         Args:
             x, y, z: 目标位置 (mm)
@@ -840,7 +844,13 @@ class InferenceClient:
         req = ServoP.Request()
         req.x, req.y, req.z = float(x), float(y), float(z)
         req.rx, req.ry, req.rz = float(rx), float(ry), float(rz)
-        self.node.call_service_async_no_wait(self.node.cli_servo_p, req)
+
+        if self.args.blocking_servo:
+            # 阻塞执行：等待 ServoP 完成
+            self.node.call_service(self.node.cli_servo_p, req)
+        else:
+            # 非阻塞执行：立即返回
+            self.node.call_service_async_no_wait(self.node.cli_servo_p, req)
 
     def set_gripper(self, position):
         """
@@ -1135,6 +1145,7 @@ class InferenceClient:
                 current_pose=current_pose,
                 gripper_state=gripper_state,
                 target_pose=np.array(target_pose, dtype=np.float32),
+                image_timestamp=self.current_image_timestamp,
             )
 
         if self.args.dry_run:
@@ -1204,6 +1215,7 @@ class InferenceClient:
                     continue
 
                 last_timestamp = latest_timestamp
+                self.current_image_timestamp = latest_timestamp  # 保存图像时间戳用于帧间隔记录
 
                 # 构建观测
                 obs = self._build_observation()

@@ -781,12 +781,25 @@ class InferenceLogAnalyzer:
 def main():
     parser = argparse.ArgumentParser(description='分析推理日志')
     parser.add_argument('h5_file', type=str, help='HDF5 文件路径')
-    parser.add_argument('--output_dir', type=str, default='./analysis_results',
-                        help='输出目录 (默认: ./analysis_results)')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='输出目录 (默认: 根据输入文件名自动生成)')
 
     args = parser.parse_args()
 
-    analyzer = InferenceLogAnalyzer(args.h5_file, args.output_dir)
+    # 如果没有指定输出目录，根据输入文件名自动生成
+    if args.output_dir is None:
+        # 从文件名中提取时间戳，如 inference_log_20260201_205009.h5 -> 20260201_205009
+        h5_filename = Path(args.h5_file).stem  # 去掉扩展名
+        # 提取时间戳部分
+        if h5_filename.startswith('inference_log_'):
+            timestamp = h5_filename.replace('inference_log_', '')
+        else:
+            timestamp = h5_filename
+        output_dir = f'/home/hit/openpi/analysis_results/{timestamp}'
+    else:
+        output_dir = args.output_dir
+
+    analyzer = InferenceLogAnalyzer(args.h5_file, output_dir)
     analyzer.run_all_analysis()
 
 
