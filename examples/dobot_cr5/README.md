@@ -75,8 +75,7 @@ cd /home/xing/openpi-main
 ### 4. 启动推理客户端
 
 ```bash
-cd /home/xing/openpi-main
-source /home/xing/openpi-main/dobot_ws/install/setup.bash
+source /home/hit/dobot_ws_xing/install/setup.bash
 python examples/dobot_cr5/main.py \
     --host localhost \
     --port 8000 \
@@ -98,9 +97,9 @@ python examples/dobot_cr5/main.py \
 ## 空运行测试
 
 在不连接机器人的情况下测试推理流程：
-
+激活dobot_collect
 ```bash
-python examples/dobot_cr5/main.py --dry-run --prompt "test task"
+python examples/dobot_cr5/main.py --dry-run --prompt "Pick up the red block and place it on the plate"
 ```
 
 ## 验证

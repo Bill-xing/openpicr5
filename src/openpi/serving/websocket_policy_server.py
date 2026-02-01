@@ -4,6 +4,7 @@ import logging
 import time
 import traceback
 
+import numpy as np
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
 import websockets.asyncio.server as _server
@@ -32,7 +33,25 @@ class WebsocketPolicyServer:
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
+        self.warmup()
         asyncio.run(self.run())
+
+    def warmup(self) -> None:
+        """预热模型，完成 PyTorch/Triton AUTOTUNE"""
+        logger.info("Warming up model...")
+
+        # 构造 dummy 输入
+        dummy_obs = {
+            "observation/image": np.zeros((224, 224, 3), dtype=np.uint8),
+            "observation/wrist_image": np.zeros((224, 224, 3), dtype=np.uint8),
+            "observation/state": np.zeros(7, dtype=np.float32),
+            "prompt": "warmup",
+        }
+
+        start_time = time.time()
+        self._policy.infer(dummy_obs)
+        elapsed = time.time() - start_time
+        logger.info(f"Model warmup completed in {elapsed:.2f}s")
 
     async def run(self):
         async with _server.serve(
