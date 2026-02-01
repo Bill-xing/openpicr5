@@ -301,7 +301,10 @@ class InferenceLogAnalyzer:
         self.results['by_action_index'] = index_stats
 
         # 绘制分组误差箱线图
-        fig, ax = plt.subplots(figsize=(10, 6))
+        # 根据数据量动态调整图表宽度
+        num_indices = len(unique_indices)
+        fig_width = max(12, num_indices * 0.5)  # 每个索引至少0.5英寸宽度
+        fig, ax = plt.subplots(figsize=(fig_width, 6))
 
         # 准备箱线图数据
         box_data = []
@@ -310,9 +313,9 @@ class InferenceLogAnalyzer:
             mask = action_indices == idx
             errors = np.linalg.norm(pose_errors[mask, :3], axis=1)  # 位置误差范数
             box_data.append(errors)
-            labels.append(f'Index {idx}')
+            labels.append(f'{int(idx)}')  # 只显示数字，去掉"Index"前缀
 
-        bp = ax.boxplot(box_data, labels=labels, patch_artist=True)
+        bp = ax.boxplot(box_data, tick_labels=labels, patch_artist=True)
 
         # 设置颜色
         colors = plt.cm.viridis(np.linspace(0, 1, len(box_data)))
@@ -320,10 +323,13 @@ class InferenceLogAnalyzer:
             patch.set_facecolor(color)
             patch.set_alpha(0.7)
 
-        ax.set_xlabel('Action Index')
-        ax.set_ylabel('Position Error Norm (mm)')
-        ax.set_title('Position Error Distribution by Action Index')
-        ax.grid(True, alpha=0.3)
+        ax.set_xlabel('Action Index', fontsize=12)
+        ax.set_ylabel('Position Error Norm (mm)', fontsize=12)
+        ax.set_title('Position Error Distribution by Action Index', fontsize=14)
+        ax.grid(True, alpha=0.3, axis='y')
+
+        # 旋转X轴标签，避免重叠
+        plt.xticks(rotation=45, ha='right', fontsize=10)
 
         plt.tight_layout()
         fig_path = self.output_dir / 'error_by_action_index.png'

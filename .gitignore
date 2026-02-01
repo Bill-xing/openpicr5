@@ -199,3 +199,5 @@ inference_logs/inference_log_20260201_204652.h5
 inference_logs/inference_log_20260201_204857.h5
 inference_logs/inference_log_20260201_205009.h5
 analysis_results/*
+template.py
+episode_32.hdf5

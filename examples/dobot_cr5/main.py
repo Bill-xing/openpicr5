@@ -789,6 +789,10 @@ class InferenceClient:
         self.current_inference_step = 0  # 当前动作来自哪次推理
         self.current_image_timestamp = None  # 当前图像时间戳（用于帧间隔记录）
 
+        # 夹爪插值平滑参数
+        self.gripper_step_length = 20  # 夹爪每步最大变化量（跳变200需要10步）
+        self.last_gripper_value = None  # 上次夹爪目标值
+
         logging.info("=== 推理客户端初始化完成 ===")
         logging.info(f"策略服务器: {args.host}:{args.port}")
         logging.info(f"任务提示: {args.prompt}")
@@ -1043,6 +1047,69 @@ class InferenceClient:
             "prompt": self.args.prompt,
         }
 
+    def _generate_interpolated_actions(self, actions: np.ndarray) -> np.ndarray:
+        """
+        根据夹爪跳变量生成插值后的动作序列
+
+        参考: template.py 的 generate_trajectory
+
+        当夹爪跳变较大时，扩展动作步数以实现平滑过渡。
+        机械臂在原始步数内正常执行，超出部分保持末尾位置。
+
+        Args:
+            actions: 原始动作序列 (N, 7)
+
+        Returns:
+            插值后的动作序列，步数可能大于原始 N
+        """
+        if len(actions) == 0:
+            return actions
+
+        # 获取第一个动作的夹爪目标值
+        first_gripper = float(actions[0, 6])
+
+        # 计算夹爪跳变
+        if self.last_gripper_value is not None:
+            gripper_jump = abs(first_gripper - self.last_gripper_value)
+        else:
+            gripper_jump = 0
+
+        # 计算夹爪需要的步数
+        gripper_steps = max(1, int(np.ceil(gripper_jump / self.gripper_step_length)))
+
+        # 原始步数
+        original_steps = len(actions)
+
+        # 总步数取最大值
+        total_steps = max(original_steps, gripper_steps)
+
+        if total_steps == original_steps:
+            # 无需插值，直接返回原始动作
+            return actions
+
+        # 需要插值：生成新的动作序列
+        logging.info(f"夹爪跳变 {gripper_jump:.0f}，扩展动作从 {original_steps} 步到 {total_steps} 步")
+
+        interpolated = np.zeros((total_steps, 7), dtype=np.float32)
+        start_gripper = self.last_gripper_value if self.last_gripper_value is not None else first_gripper
+        target_gripper = float(actions[-1, 6])  # 最终夹爪目标
+
+        for step in range(total_steps):
+            # 机械臂位姿：在原始范围内使用原始值，超出保持末尾
+            if step < original_steps:
+                arm_pose = actions[step, :6]
+            else:
+                arm_pose = actions[-1, :6]
+
+            # 夹爪：线性插值
+            progress = (step + 1) / total_steps
+            gripper_value = start_gripper + progress * (target_gripper - start_gripper)
+
+            interpolated[step, :6] = arm_pose
+            interpolated[step, 6] = gripper_value
+
+        return interpolated
+
     def _get_action(self, obs: dict):
         """获取动作（使用动作队列 + 重规划）"""
         if not self.action_queue:
@@ -1079,9 +1146,17 @@ class InferenceClient:
                 self.current_inference_step = self.perf_stats['inference_count']
                 self.current_action_index = 0
 
-                # 只取前replan_steps个动作
-                for i in range(min(self.args.replan_steps, len(actions))):
-                    self.action_queue.append(actions[i])
+                # 取前 replan_steps 个动作，并根据夹爪跳变进行插值
+                original_actions = actions[:min(self.args.replan_steps, len(actions))]
+                interpolated_actions = self._generate_interpolated_actions(original_actions)
+
+                # 更新上次夹爪值
+                if len(interpolated_actions) > 0:
+                    self.last_gripper_value = float(interpolated_actions[-1, 6])
+
+                # 填充动作队列
+                for i in range(len(interpolated_actions)):
+                    self.action_queue.append(interpolated_actions[i])
 
             except Exception as e:
                 logging.error(f"Inference failed: {e}")
