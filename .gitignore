@@ -190,3 +190,10 @@ src/openpi/lerobot_dataset/videos/observation.images.top/chunk-000/episode_00000
 src/openpi/lerobot_dataset/videos/observation.images.top/chunk-000/episode_000003.mp4
 /mnt/data/lv_qi/xing/openpi/my_data/*
 my_data/*
+analysis_results/*
+inference_logs/*
+data_collector4.py
+dataset_player.py
+recorder_optimized.py
+template.py
+episode_32.hdf5
