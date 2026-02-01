@@ -127,9 +127,26 @@ class DataLogger:
         self.args = args
         self.record_images = args.record_images  # 是否记录图像
 
-        # 生成文件名
+        # 生成文件名（包含关键参数）
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.filename = self.record_dir / f"inference_log_{timestamp}.h5"
+
+        # 简化 blocking_servo 的表示
+        bs_str = str(args.blocking_servo).replace('_', '')  # last_blocking -> lastblocking
+        if bs_str.lower() == 'true':
+            bs_str = 'T'
+        elif bs_str.lower() == 'false':
+            bs_str = 'F'
+
+        # 构建文件名
+        filename_parts = [
+            f"inference_log_{timestamp}",
+            f"bs{bs_str}",
+            f"od{args.observation_delay_ms}",
+            f"rp{args.replan_steps}",
+            f"ms{args.max_steps}",
+        ]
+        filename = "_".join(filename_parts) + ".h5"
+        self.filename = self.record_dir / filename
 
         # 推理记录缓冲区（低频，约 6Hz）
         self.inference_data = {
@@ -1292,9 +1309,10 @@ class InferenceClient:
                         time.sleep(target_dt - elapsed)
                     last_step_time = time.time()
 
-                # 观测延迟：等待ServoP部分完成再读取状态
-                # 注意：在ServoPNoWait模式下，这个延迟需要精细调整
-                if self.args.observation_delay_ms > 0:
+                # 观测延迟：仅在非阻塞模式下使用
+                # 阻塞模式下ServoP会等待执行完成，不需要额外延迟
+                # 强制忽略以避免误用导致震荡
+                if self.args.observation_delay_ms > 0 and not use_rate_limit:
                     time.sleep(self.args.observation_delay_ms / 1000.0)
 
                 # 构建观测

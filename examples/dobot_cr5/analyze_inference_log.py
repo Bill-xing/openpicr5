@@ -762,14 +762,19 @@ def main():
 
     # 如果没有指定输出目录，根据输入文件名自动生成
     if args.output_dir is None:
-        # 从文件名中提取时间戳，如 inference_log_20260201_205009.h5 -> 20260201_205009
+        # 从文件名中提取目录名
+        # 支持两种格式：
+        # 1. 旧格式: inference_log_20260201_205009.h5 -> 20260201_205009
+        # 2. 新格式: inference_log_20260202_040122_bsT_od10_rp3_ms600.h5 -> 20260202_040122_bsT_od10_rp3_ms600
         h5_filename = Path(args.h5_file).stem  # 去掉扩展名
-        # 提取时间戳部分
+
+        # 去掉 inference_log_ 前缀，保留所有参数
         if h5_filename.startswith('inference_log_'):
-            timestamp = h5_filename.replace('inference_log_', '')
+            output_name = h5_filename.replace('inference_log_', '')
         else:
-            timestamp = h5_filename
-        output_dir = f'/home/hit/openpi/analysis_results/{timestamp}'
+            output_name = h5_filename
+
+        output_dir = f'/home/hit/openpi/analysis_results/{output_name}'
     else:
         output_dir = args.output_dir
 
