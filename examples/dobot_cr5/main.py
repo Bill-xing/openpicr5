@@ -546,6 +546,13 @@ class InferenceClient:
         self.step_count = 0
         self.inference_enabled = False
 
+        # 性能监控
+        self.perf_stats = {
+            'inference_count': 0,                    # 推理调用次数
+            'inference_times': deque(maxlen=100),    # 最近100次推理延迟
+            'last_inference_time': None,             # 上次推理时间戳
+        }
+
         logging.info("=== 推理客户端初始化完成 ===")
         logging.info(f"策略服务器: {args.host}:{args.port}")
         logging.info(f"任务提示: {args.prompt}")
@@ -799,9 +806,20 @@ class InferenceClient:
             try:
                 if self.step_count == 0:
                     logging.info("Calling policy inference for first time...")
+
+                # 记录推理开始时间
+                t0 = time.time()
                 result = self.policy_client.infer(obs)
+                inference_time = time.time() - t0
+
+                # 更新统计
+                self.perf_stats['inference_count'] += 1
+                self.perf_stats['inference_times'].append(inference_time)
+                self.perf_stats['last_inference_time'] = time.time()
+
                 if self.step_count == 0:
-                    logging.info("First inference completed!")
+                    logging.info(f"First inference completed! Latency: {inference_time*1000:.1f}ms")
+
                 actions = result["actions"]
 
                 # 只取前replan_steps个动作
@@ -921,12 +939,24 @@ class InferenceClient:
                 # 打印进度（每30帧）
                 if self.step_count % 30 == 0:
                     elapsed = time.time() - start_time
-                    fps = self.step_count / elapsed if elapsed > 0 else 0
+                    action_fps = self.step_count / elapsed if elapsed > 0 else 0
+                    inf_count = self.perf_stats['inference_count']
+                    inf_fps = inf_count / elapsed if elapsed > 0 else 0
+
+                    # 推理延迟统计
+                    if self.perf_stats['inference_times']:
+                        inf_times = list(self.perf_stats['inference_times'])
+                        inf_mean = np.mean(inf_times) * 1000
+                        inf_max = np.max(inf_times) * 1000
+                    else:
+                        inf_mean = inf_max = 0
+
                     logging.info(
-                        f"Step {self.step_count}, "
-                        f"elapsed: {elapsed:.1f}s, "
-                        f"fps: {fps:.1f}, "
-                        f"action queue: {len(self.action_queue)}"
+                        f"Step {self.step_count} | "
+                        f"动作频率: {action_fps:.1f}Hz (目标30) | "
+                        f"推理频率: {inf_fps:.1f}Hz (预期{30/self.args.replan_steps:.0f}) | "
+                        f"推理延迟: {inf_mean:.0f}ms (max:{inf_max:.0f}ms) | "
+                        f"队列: {len(self.action_queue)}"
                     )
 
             logging.info(f"\n=== 推理完成 ===")
