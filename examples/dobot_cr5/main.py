@@ -28,6 +28,7 @@ ROS话题：
 python examples/dobot_cr5/main.py --host localhost --port 8000 --prompt "pick up the red block"
 """
 
+import bisect
 import dataclasses
 import logging
 import re
@@ -167,6 +168,10 @@ class DobotRosWrapper(Node):
         self.latest_image = None
         self.bridge = CvBridge()
 
+        # 新增：带时间戳的历史缓冲区（环形队列）
+        self.image_buffer = deque(maxlen=60)      # (timestamp, cv_image) 最多保留60帧（2秒@30Hz）
+        self.state_buffer = deque(maxlen=200)     # (timestamp, state) 最多保留200帧（2秒@100Hz）
+
         self.sub_image = self.create_subscription(
             Image, "/camera/color/image_raw", self._image_callback, sensor_qos
         )
@@ -182,17 +187,31 @@ class DobotRosWrapper(Node):
             self.get_logger().warn("Dobot服务未就绪")
 
     def _image_callback(self, msg: Image):
-        """图像回调"""
+        """图像回调 - 保存带时间戳的图像"""
         try:
-            self.latest_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+
+            # 保存到历史缓冲区
+            self.image_buffer.append((timestamp, cv_image))
+
+            # 保持兼容性
+            self.latest_image = cv_image
         except Exception as e:
             self.get_logger().error(f"Image conversion failed: {e}")
 
     def _robot_current_callback(self, msg: ToolVectorActual):
-        """机器人当前位姿回调"""
-        self.robot_state = np.array(
+        """机器人当前位姿回调 - 保存带时间戳的状态"""
+        state = np.array(
             [msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz], dtype=np.float32
         )
+        timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+
+        # 保存到历史缓冲区
+        self.state_buffer.append((timestamp, state))
+
+        # 保持兼容性
+        self.robot_state = state
 
     def call_service(self, client, request):
         """
@@ -630,28 +649,142 @@ class InferenceClient:
         msg.rz = float(pose[5])
         self.node.pub_robot_target.publish(msg)
 
+    def interpolate_state_fast(self, buffer, target_time):
+        """
+        高效插值算法 - 使用二分查找定位，线性插值数据
+
+        参考：recorder_optimized.py:345-450
+
+        Args:
+            buffer (deque): 存储(时间戳, 状态)的缓冲区
+            target_time (float): 目标时间戳
+
+        Returns:
+            插值后的状态数组 (6,) 或 None
+        """
+        if len(buffer) < 2:
+            if buffer:
+                _, state = buffer[-1]
+                return state
+            return None
+
+        # deque转列表
+        buffer_list = list(buffer)
+        timestamps = [t for t, _ in buffer_list]
+
+        # 二分查找
+        idx = bisect.bisect_left(timestamps, target_time)
+
+        # 边界情况
+        if idx == 0:
+            return buffer_list[0][1]
+        if idx == len(buffer_list):
+            return buffer_list[-1][1]
+
+        # 获取前后两个点
+        t_before, state_before = buffer_list[idx - 1]
+        t_after, state_after = buffer_list[idx]
+
+        # 时间戳完全匹配
+        if abs(t_before - target_time) < 1e-6:
+            return state_before
+        if abs(t_after - target_time) < 1e-6:
+            return state_after
+
+        # 线性插值
+        alpha = (target_time - t_before) / (t_after - t_before)
+        alpha = max(0.0, min(1.0, alpha))
+
+        interpolated = state_before * (1 - alpha) + state_after * alpha
+        return interpolated
+
+    def find_closest_image(self, target_time, tolerance=0.1):
+        """
+        高效查找最接近的图像（用于图像同步）
+
+        参考：recorder_optimized.py:452-519
+
+        Args:
+            target_time (float): 目标时间戳
+            tolerance (float): 时间容差（秒），默认0.1秒
+
+        Returns:
+            tuple: (timestamp, cv_image) 或 None
+        """
+        if not self.node.image_buffer:
+            return None
+
+        buffer_list = list(self.node.image_buffer)
+        timestamps = [t for t, _ in buffer_list]
+
+        # 二分查找
+        idx = bisect.bisect_left(timestamps, target_time)
+
+        if idx == 0:
+            t, img = buffer_list[0]
+            if abs(t - target_time) <= tolerance:
+                return (t, img)
+            return None
+
+        if idx == len(buffer_list):
+            t, img = buffer_list[-1]
+            if abs(t - target_time) <= tolerance:
+                return (t, img)
+            return None
+
+        # 比较前后两个，返回更接近的
+        t_before, img_before = buffer_list[idx - 1]
+        t_after, img_after = buffer_list[idx]
+
+        diff_before = abs(t_before - target_time)
+        diff_after = abs(t_after - target_time)
+
+        if diff_before < diff_after and diff_before <= tolerance:
+            return (t_before, img_before)
+        elif diff_after <= tolerance:
+            return (t_after, img_after)
+
+        return None
+
     def _build_observation(self):
-        """构建观测数据"""
-        if self.node.robot_state is None:
-            logging.warning("Robot state not available")
+        """构建观测数据（带时间同步）"""
+        # 1. 检查缓冲区
+        if not self.node.image_buffer or not self.node.state_buffer:
+            logging.warning("Insufficient data for observation")
             return None
 
-        if self.node.latest_image is None:
-            logging.warning("Image not available")
+        # 2. 以最新图像时间戳为基准
+        img_timestamp, cv_image = self.node.image_buffer[-1]
+
+        # 3. 在图像时间戳处插值机器人状态
+        robot_state = self.interpolate_state_fast(
+            self.node.state_buffer,
+            img_timestamp
+        )
+
+        if robot_state is None:
+            logging.warning("Could not interpolate robot state")
             return None
 
-        # 图像预处理：BGR→RGB，resize到224x224
-        img = cv2.cvtColor(self.node.latest_image, cv2.COLOR_BGR2RGB)
+        # 4. 图像预处理
+        img = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
         img = image_tools.resize_with_pad(img, self.args.resize_size, self.args.resize_size)
         img = image_tools.convert_to_uint8(img)
 
-        # 夹爪状态归一化 (0-1000 -> 0-1)
+        # 5. 夹爪状态（使用当前值，因为没有时间戳）
         gripper_normalized = self.gripper_target_pos[0] / 1000.0
 
-        # 状态向量：[x,y,z,rx,ry,rz,gripper_normalized]
-        state = np.concatenate(
-            [self.node.robot_state, [gripper_normalized]]
-        ).astype(np.float32)
+        # 6. 状态向量
+        state = np.concatenate([robot_state, [gripper_normalized]]).astype(np.float32)
+
+        # 7. 记录同步信息（可选，用于调试）
+        if self.step_count % 100 == 0:
+            # 计算时间差
+            state_timestamps = [t for t, _ in self.node.state_buffer]
+            closest_state_time = min(state_timestamps, key=lambda t: abs(t - img_timestamp))
+            time_diff = abs(closest_state_time - img_timestamp)
+            logging.info(f"Time sync: img_time={img_timestamp:.6f}, "
+                        f"state_time_diff={time_diff*1000:.1f}ms")
 
         return {
             "observation/image": img,
@@ -753,18 +886,23 @@ class InferenceClient:
 
         self.inference_enabled = True
         start_time = time.time()
-        last_image = None
+        last_timestamp = None
 
         try:
             while self.inference_enabled and self.step_count < self.args.max_steps:
                 loop_start = time.time()
 
-                # 等待新图像（30Hz）
-                current_image = self.node.latest_image
-                if current_image is last_image:
+                # 检查是否有新图像
+                if not self.node.image_buffer:
                     time.sleep(0.001)
                     continue
-                last_image = current_image
+
+                latest_timestamp, _ = self.node.image_buffer[-1]
+                if latest_timestamp == last_timestamp:
+                    time.sleep(0.001)
+                    continue
+
+                last_timestamp = latest_timestamp
 
                 # 构建观测
                 obs = self._build_observation()
