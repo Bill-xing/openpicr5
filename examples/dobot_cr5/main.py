@@ -1,25 +1,35 @@
+#!/usr/bin/env python3
 """
 CR5 真机推理客户端
 
-功能：
-1. 连接到远程策略服务器（WebSocket）
-2. 订阅ROS2话题获取图像和机器人状态
-3. 以30Hz频率执行策略推理
-4. 发送ServoP指令控制机器人
-5. 控制Modbus夹爪
+功能概述：
+连接到远程策略服务器，订阅ROS2话题获取图像和机器人状态，
+以30Hz频率执行策略推理，控制Dobot机械臂和夹爪执行动作。
 
-架构：
-- 图像到达触发推理（30Hz，与训练数据一致）
-- 机器人状态订阅用于构建观测
-- 发布目标位姿和夹爪状态（与data_collector4兼容）
+主要组件：
+1. DobotRosWrapper: ROS接口封装，提供服务客户端和话题发布器
+2. GripperComm: 夹爪Modbus通信管理，控制夹爪开合
+3. GripperStateFeedback: 夹爪状态反馈线程，使用时间插补将10Hz采样提升到100Hz发布
+4. InferenceClient: 主推理类，连接策略服务器并执行推理循环
 
-使用：
-    python examples/dobot_cr5/main.py --host localhost --port 8000 --prompt "pick up the red block"
+技术特点：
+- 高频控制：使用ServoP伺服模式，30Hz控制频率（与训练数据一致）
+- 时间插补：夹爪状态使用线性插补，将低频Modbus读取平滑到高频发布
+- 异步非阻塞：ServoP和夹爪控制使用异步调用，避免阻塞推理循环
+
+ROS话题：
+- 订阅 /camera/color/image_raw: RGB图像（30Hz）
+- 订阅 /dobot_msgs_v3/msg/ToolVectorActual: 机器人当前位姿
+- 发布 /robot/target_pose: 机械臂目标姿态
+- 发布 /gripper/state_feedback: 夹爪实际位置（100Hz插补）
+- 发布 /gripper/command_update: 夹爪目标位置（100Hz插补）
+
+使用方法：
+python examples/dobot_cr5/main.py --host localhost --port 8000 --prompt "pick up the red block"
 """
 
 import dataclasses
 import logging
-import queue
 import re
 import threading
 import time
@@ -75,174 +85,32 @@ class Args:
     dry_run: bool = False  # 空运行模式：只打印动作，不执行
 
 
-class GripperController(threading.Thread):
+class DobotRosWrapper(Node):
     """
-    夹爪控制线程 - 参考data_collector4.py的GripperManager
+    机械臂ROS接口封装
 
-    功能：
-    1. 初始化Modbus连接
-    2. 以50Hz频率发送夹爪目标位置
-    3. 以10Hz频率读取夹爪实际位置
-    """
+    提供与Dobot机械臂交互的ROS服务客户端和话题发布器。
+    封装了机械臂控制、夹爪通信、状态发布等功能。
 
-    def __init__(self, node: Node):
-        super().__init__(daemon=True)
-        self.node = node
-        self.modbus_id = 0
-        self.target_pos = 1000.0  # 目标位置 0-1000（1000=完全张开）
-        self.current_pos = 1000.0  # 当前位置 0-1000
-        self.running = True
-        self._init_modbus()
-
-    def _call_service(self, client, request):
-        """同步调用服务"""
-        if not client.service_is_ready():
-            return None
-        future = client.call_async(request)
-        while not future.done():
-            time.sleep(0.001)
-        return future.result()
-
-    def _init_modbus(self):
-        """初始化Modbus连接"""
-        # 创建服务客户端
-        self.cli_modbus_create = self.node.create_client(
-            ModbusCreate, "/dobot_bringup_v3/srv/ModbusCreate"
-        )
-        self.cli_modbus_close = self.node.create_client(
-            ModbusClose, "/dobot_bringup_v3/srv/ModbusClose"
-        )
-        self.cli_set_hold_regs = self.node.create_client(
-            SetHoldRegs, "/dobot_bringup_v3/srv/SetHoldRegs"
-        )
-        self.cli_get_hold_regs = self.node.create_client(
-            GetHoldRegs, "/dobot_bringup_v3/srv/GetHoldRegs"
-        )
-
-        # 等待服务可用
-        logging.info("Waiting for Modbus services...")
-        self.cli_modbus_create.wait_for_service(timeout_sec=5.0)
-
-        # 关闭旧连接
-        logging.info("Closing old Modbus connections...")
-        for i in range(1, 5):
-            req = ModbusClose.Request()
-            req.index = i
-            self._call_service(self.cli_modbus_close, req)
-
-        # 创建新连接
-        logging.info("Creating Modbus connection...")
-        req = ModbusCreate.Request()
-        req.ip = "127.0.0.1"
-        req.port = 60000
-        req.slave_id = 1
-        req.is_rtu = 1
-        res = self._call_service(self.cli_modbus_create, req)
-
-        if res and res.res == 0:
-            match = re.search(r"(\d+)", str(res.index))
-            self.modbus_id = int(match.group(1)) if match else int(res.index)
-            logging.info(f"Gripper connected, Modbus ID: {self.modbus_id}")
-
-            # 初始化夹爪
-            self._write_reg(256, 1, "1")  # Enable
-            self._write_reg(257, 1, "60")  # Force/Speed
-        else:
-            logging.error(f"Gripper ModbusCreate failed: {res}")
-            self.modbus_id = 0
-
-        # 读取初始位置
-        if self.modbus_id > 0:
-            init_val = self._read_reg(514)
-            if init_val is not None:
-                self.current_pos = float(init_val)
-                logging.info(f"Gripper initial position: {self.current_pos}")
-
-    def _write_reg(self, addr: int, count: int, val_str: str):
-        """写入Modbus寄存器"""
-        if self.modbus_id <= 0:
-            return
-        req = SetHoldRegs.Request()
-        req.index = self.modbus_id
-        req.addr = addr
-        req.count = count
-        req.val_tab = val_str
-        self._call_service(self.cli_set_hold_regs, req)
-
-    def _read_reg(self, addr: int):
-        """读取Modbus寄存器"""
-        if self.modbus_id <= 0:
-            return None
-        req = GetHoldRegs.Request()
-        req.index = self.modbus_id
-        req.addr = addr
-        req.count = 1
-        res = self._call_service(self.cli_get_hold_regs, req)
-        if res and res.res == 0:
-            try:
-                return int(res.value)
-            except Exception:
-                pass
-        return None
-
-    def set_target(self, pos: float):
-        """设置目标位置 (0-1000)"""
-        self.target_pos = max(0.0, min(1000.0, float(pos)))
-
-    def run(self):
-        """控制循环 (50Hz发送指令，10Hz读取实际位置)"""
-        read_counter = 0
-        while self.running:
-            # 发送目标位置
-            self._write_reg(259, 1, str(int(self.target_pos)))
-
-            # 每5次读取一次实际位置（10Hz）
-            read_counter += 1
-            if read_counter >= 5:
-                read_counter = 0
-                real_pos = self._read_reg(514)
-                if real_pos is not None:
-                    self.current_pos = float(real_pos)
-
-            time.sleep(0.02)  # 50Hz
-
-    def stop(self):
-        """停止控制线程"""
-        self.running = False
-
-
-class CR5InferenceNode(Node):
-    """
-    CR5推理ROS2节点
-
-    订阅：
-    - /camera/color/image_raw - RGB图像（30Hz，触发推理）
-    - /dobot_msgs_v3/msg/ToolVectorActual - 机器人当前位姿
-
-    发布：
-    - /robot/target_pose - 机器人目标位姿
-    - /gripper/command_update - 夹爪目标状态
-    - /gripper/state_feedback - 夹爪实际状态反馈
+    主要功能：
+    - 机械臂使能、清除错误、速度设置
+    - ServoP伺服运动控制
+    - 获取当前位姿
+    - Modbus通信（用于夹爪控制）
+    - 发布机械臂目标姿态和夹爪状态
+    - 订阅相机图像和机器人状态（用于推理）
     """
 
-    def __init__(self, args: Args):
-        super().__init__("cr5_inference_node")
-        self.args = args
+    def __init__(self, node_name="inference_client"):
+        """
+        初始化ROS节点和服务客户端
 
-        # 状态变量
-        self.robot_state = None  # 机器人当前位姿 (6,)
-        self.latest_image = None  # 最新图像
-        self.action_queue = deque()  # 动作队列
-        self.inference_enabled = False  # 推理使能标志
-        self.step_count = 0  # 执行步数计数
-        self.bridge = CvBridge()
+        Args:
+            node_name: ROS节点名称，默认为"inference_client"
+        """
+        super().__init__(node_name)
 
-        # 推理队列（线程安全）
-        self.inference_queue = queue.Queue(maxsize=2)  # 最多缓存2帧图像
-        self.inference_thread = None
-        self.inference_running = False
-
-        # ========== 服务客户端 ==========
+        # === 机械臂控制服务客户端 ===
         self.cli_enable = self.create_client(
             EnableRobot, "/dobot_bringup_v3/srv/EnableRobot"
         )
@@ -255,54 +123,88 @@ class CR5InferenceNode(Node):
         self.cli_servo_p = self.create_client(ServoP, "/dobot_bringup_v3/srv/ServoP")
         self.cli_get_pose = self.create_client(GetPose, "/dobot_bringup_v3/srv/GetPose")
 
-        # ========== QoS配置 ==========
-        # 相机话题使用BEST_EFFORT（RealSense默认配置）
+        # === Modbus通信服务客户端（用于夹爪控制）===
+        self.cli_modbus_create = self.create_client(
+            ModbusCreate, "/dobot_bringup_v3/srv/ModbusCreate"
+        )
+        self.cli_modbus_close = self.create_client(
+            ModbusClose, "/dobot_bringup_v3/srv/ModbusClose"
+        )
+        self.cli_set_hold_regs = self.create_client(
+            SetHoldRegs, "/dobot_bringup_v3/srv/SetHoldRegs"
+        )
+        self.cli_get_hold_regs = self.create_client(
+            GetHoldRegs, "/dobot_bringup_v3/srv/GetHoldRegs"
+        )
+
+        # === 话题发布器 ===
+        self.pub_robot_target = self.create_publisher(
+            ToolVectorActual, "/robot/target_pose", 10
+        )
+        self.pub_gripper_state = self.create_publisher(
+            PointStamped, "/gripper/state_feedback", 10
+        )
+        self.pub_gripper_update = self.create_publisher(
+            PointStamped, "/gripper/command_update", 10
+        )
+
+        # === QoS配置 ===
         sensor_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=10,
         )
-
-        # 机器人状态话题使用RELIABLE（匹配dobot_feedback发布者）
         robot_qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,  # 必须与发布者匹配
+            reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.VOLATILE,
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=10,
         )
 
-        # ========== 订阅器 ==========
-        # 相机图像 - 30Hz，触发推理
+        # === 话题订阅器（用于推理）===
+        self.robot_state = None
+        self.latest_image = None
+        self.bridge = CvBridge()
+
         self.sub_image = self.create_subscription(
-            Image, "/camera/color/image_raw", self.image_callback, sensor_qos
+            Image, "/camera/color/image_raw", self._image_callback, sensor_qos
         )
-        # 机器人当前位姿 - 100Hz，由驱动发布
         self.sub_robot_current = self.create_subscription(
             ToolVectorActual,
             "/dobot_msgs_v3/msg/ToolVectorActual",
-            self.robot_current_callback,
+            self._robot_current_callback,
             robot_qos,
         )
 
-        # ========== 发布器（与data_collector4兼容）==========
-        # 机器人目标位姿
-        self.pub_robot_target = self.create_publisher(
-            ToolVectorActual, "/robot/target_pose", 10
-        )
-        # 夹爪目标状态
-        self.pub_gripper_target = self.create_publisher(
-            PointStamped, "/gripper/command_update", 5
-        )
-        # 夹爪实际状态反馈
-        self.pub_gripper_state = self.create_publisher(
-            PointStamped, "/gripper/state_feedback", 5
-        )
+        self.get_logger().info("等待Dobot服务...")
+        if not self.cli_servo_p.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn("Dobot服务未就绪")
 
-        logging.info("CR5InferenceNode initialized")
+    def _image_callback(self, msg: Image):
+        """图像回调"""
+        try:
+            self.latest_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception as e:
+            self.get_logger().error(f"Image conversion failed: {e}")
+
+    def _robot_current_callback(self, msg: ToolVectorActual):
+        """机器人当前位姿回调"""
+        self.robot_state = np.array(
+            [msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz], dtype=np.float32
+        )
 
     def call_service(self, client, request):
-        """同步调用服务"""
+        """
+        同步调用ROS服务并等待结果
+
+        Args:
+            client: ROS服务客户端
+            request: 服务请求对象
+
+        Returns:
+            服务响应结果，如果服务未就绪则返回None
+        """
         if not client.service_is_ready():
             return None
         future = client.call_async(request)
@@ -310,82 +212,456 @@ class CR5InferenceNode(Node):
             time.sleep(0.001)
         return future.result()
 
-    def robot_current_callback(self, msg: ToolVectorActual):
-        """机器人当前位姿回调"""
-        if self.robot_state is None:
-            logging.info("Robot state callback received first message")
-        self.robot_state = np.array(
-            [msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz], dtype=np.float32
+    def call_service_async_no_wait(self, client, request):
+        """
+        异步发送服务请求，不等待结果
+
+        用于高频控制场景（如ServoP），避免阻塞主循环。
+
+        Args:
+            client: ROS服务客户端
+            request: 服务请求对象
+        """
+        if client.service_is_ready():
+            client.call_async(request)
+
+
+class GripperComm:
+    """
+    夹爪Modbus通信管理类
+
+    通过Modbus RTU协议与夹爪通信，控制夹爪开合和读取状态。
+    使用机械臂控制器作为Modbus主站，通过127.0.0.1:60000端口通信。
+
+    关键寄存器地址：
+    - 256: 使能寄存器 (1=使能)
+    - 257: 力度/速度寄存器 (0-100)
+    - 259: 目标位置寄存器 (0-1000，0=全开，1000=全闭)
+    - 514: 当前位置反馈寄存器 (0-1000)
+    """
+
+    def __init__(self, wrapper: DobotRosWrapper):
+        """
+        初始化夹爪通信
+
+        Args:
+            wrapper: DobotRosWrapper实例，用于调用Modbus服务
+        """
+        self.wrapper = wrapper
+        self.id = 0
+        self.init_connection()
+
+    def init_connection(self):
+        """
+        初始化Modbus连接
+
+        步骤：
+        1. 关闭可能存在的旧连接（索引1-4）
+        2. 创建新的Modbus RTU连接
+        3. 初始化夹爪寄存器（使能、力度/速度）
+        """
+        logging.info("[Gripper] 关闭旧连接...")
+        for i in range(1, 5):
+            req = ModbusClose.Request()
+            req.index = i
+            self.wrapper.call_service(self.wrapper.cli_modbus_close, req)
+
+        logging.info("[Gripper] 创建Modbus连接...")
+        req = ModbusCreate.Request()
+        req.ip = "127.0.0.1"
+        req.port = 60000
+        req.slave_id = 1
+        req.is_rtu = 1
+        res = self.wrapper.call_service(self.wrapper.cli_modbus_create, req)
+
+        if res and res.res == 0:
+            match = re.search(r"(\d+)", str(res.index))
+            self.id = int(match.group(1)) if match else int(res.index)
+            logging.info(f"[Gripper] 连接成功, ID: {self.id}")
+        else:
+            logging.error(f"[Gripper] 连接失败! Response: {res}")
+            self.id = 0
+
+        if self.id > 0:
+            logging.info("[Gripper] 初始化寄存器...")
+            self.write_reg(256, 1, "1", wait=True)  # 使能夹爪
+            self.write_reg(257, 1, "60", wait=True)  # 设置力度/速度为60%
+
+    def write_reg(self, addr, count, val_str, wait=False):
+        """
+        写Modbus保持寄存器
+
+        Args:
+            addr: 寄存器起始地址
+            count: 要写入的寄存器数量
+            val_str: 要写入的值（字符串格式）
+            wait: 是否等待写入完成（True=同步，False=异步）
+        """
+        if self.id <= 0:
+            return
+        req = SetHoldRegs.Request()
+        req.index = self.id
+        req.addr = addr
+        req.count = count
+        req.val_tab = val_str
+        if wait:
+            self.wrapper.call_service(self.wrapper.cli_set_hold_regs, req)
+        else:
+            self.wrapper.call_service_async_no_wait(self.wrapper.cli_set_hold_regs, req)
+
+    def read_reg(self, addr):
+        """
+        读取Modbus保持寄存器
+
+        Args:
+            addr: 寄存器地址
+
+        Returns:
+            寄存器值（整数），失败返回None
+        """
+        if self.id <= 0:
+            return None
+        req = GetHoldRegs.Request()
+        req.index = self.id
+        req.addr = addr
+        req.count = 1
+        res = self.wrapper.call_service(self.wrapper.cli_get_hold_regs, req)
+        if res and res.res == 0:
+            try:
+                return int(res.value)
+            except Exception:
+                pass
+        return None
+
+
+class GripperStateFeedback(threading.Thread):
+    """
+    夹爪状态反馈线程
+
+    定期读取夹爪实际位置并发布当前状态和目标状态。
+    使用时间插补技术将低频Modbus读取（10Hz）插补到高频发布（100Hz）。
+
+    工作原理：
+    1. 以10Hz频率读取夹爪实际位置（寄存器514）
+    2. 以10Hz频率采样目标位置（从InferenceClient）
+    3. 使用线性插补算法，在两次采样之间进行时间插值
+    4. 以100Hz频率发布插补后的状态和目标位置
+    """
+
+    def __init__(self, wrapper: DobotRosWrapper, comm: GripperComm, target_pos_ref: list):
+        """
+        初始化夹爪状态反馈线程
+
+        Args:
+            wrapper: DobotRosWrapper实例，用于发布话题
+            comm: GripperComm实例，用于读取夹爪位置
+            target_pos_ref: 目标位置引用（列表），与InferenceClient共享
+        """
+        super().__init__(daemon=True)
+        self.wrapper = wrapper
+        self.comm = comm
+        self.target_pos_ref = target_pos_ref
+        self.running = True
+
+        # 频率设置
+        self.feedback_rate = 100.0  # 发布频率 100Hz
+        self.modbus_read_rate = 10.0  # Modbus读取频率 10Hz
+        self.read_interval = 1.0 / self.modbus_read_rate
+
+        # 插补状态变量
+        self.last_read_time = time.time()
+        self.last_real_pos = None
+        self.current_real_pos = None
+        self.last_real_read_time = None
+        self.current_real_read_time = None
+        self.last_target_pos = None
+        self.current_target_pos = None
+        self.last_target_read_time = None
+        self.current_target_read_time = None
+
+    def _interpolate(self, last_val, current_val, last_time, current_time, now):
+        """
+        基于时间的线性插补算法
+
+        Args:
+            last_val: 上一次采样的值
+            current_val: 当前采样的值
+            last_time: 上一次采样的时间戳
+            current_time: 当前采样的时间戳
+            now: 当前时刻
+
+        Returns:
+            插补后的值（float）
+        """
+        if last_val is None or current_val is None:
+            return current_val if current_val is not None else 0.0
+
+        if last_time is None or current_time is None:
+            return current_val
+
+        time_span = current_time - last_time
+        if time_span <= 0:
+            return current_val
+
+        elapsed = now - last_time
+        alpha = min(1.0, elapsed / time_span)
+        return last_val + alpha * (current_val - last_val)
+
+    def run(self):
+        """核心循环：100Hz发布夹爪状态"""
+        while self.running:
+            try:
+                now = time.time()
+                timestamp = self.wrapper.get_clock().now().to_msg()
+
+                # 每0.1秒读取一次真实值（10Hz采样）
+                if now - self.last_read_time >= self.read_interval:
+                    self.last_read_time = now
+
+                    # 读取夹爪实际位置
+                    real_pos = self.comm.read_reg(514)
+                    if real_pos is not None:
+                        self.last_real_pos = self.current_real_pos
+                        self.last_real_read_time = self.current_real_read_time
+                        self.current_real_pos = float(real_pos)
+                        self.current_real_read_time = now
+
+                    # 读取目标位置
+                    target = self.target_pos_ref[0] if self.target_pos_ref else 0.0
+                    self.last_target_pos = self.current_target_pos
+                    self.last_target_read_time = self.current_target_read_time
+                    self.current_target_pos = target
+                    self.current_target_read_time = now
+
+                # 计算插补后的值
+                interpolated_current = self._interpolate(
+                    self.last_real_pos,
+                    self.current_real_pos,
+                    self.last_real_read_time,
+                    self.current_real_read_time,
+                    now,
+                )
+                interpolated_target = self._interpolate(
+                    self.last_target_pos,
+                    self.current_target_pos,
+                    self.last_target_read_time,
+                    self.current_target_read_time,
+                    now,
+                )
+
+                # 发布实际位置反馈
+                msg_current = PointStamped()
+                msg_current.header.stamp = timestamp
+                msg_current.header.frame_id = "gripper_feedback"
+                msg_current.point.x = float(interpolated_current) if interpolated_current else 0.0
+                self.wrapper.pub_gripper_state.publish(msg_current)
+
+                # 发布目标位置
+                msg_target = PointStamped()
+                msg_target.header.stamp = timestamp
+                msg_target.header.frame_id = "gripper_command"
+                msg_target.point.x = float(interpolated_target) if interpolated_target else 0.0
+                self.wrapper.pub_gripper_update.publish(msg_target)
+
+            except Exception as e:
+                logging.error(f"[ERROR] GripperStateFeedback: {e}")
+
+            time.sleep(1.0 / self.feedback_rate)
+
+
+class InferenceClient:
+    """
+    推理客户端主类
+
+    连接到远程策略服务器，订阅ROS2话题获取图像和机器人状态，
+    执行策略推理并控制机械臂和夹爪执行动作。
+
+    主要功能：
+    1. 初始化ROS节点和机械臂通信
+    2. 初始化夹爪通信和状态反馈
+    3. 连接策略服务器
+    4. 执行推理循环
+    5. 发布目标姿态供评估对比
+    """
+
+    def __init__(self, args: Args):
+        """
+        初始化推理客户端
+
+        Args:
+            args: 命令行参数配置
+        """
+        self.args = args
+
+        # 初始化ROS
+        if not rclpy.ok():
+            rclpy.init()
+
+        self.node = DobotRosWrapper()
+
+        # ROS Spin线程
+        self.spin_thread = threading.Thread(
+            target=rclpy.spin, args=(self.node,), daemon=True
         )
+        self.spin_thread.start()
 
-    def image_callback(self, msg: Image):
-        """图像回调 - 非阻塞，只负责数据采集（30Hz）"""
-        if self.latest_image is None:
-            logging.info("Image callback received first message")
-        if not self.inference_enabled:
-            self.latest_image = True  # 标记已收到图像
-            return
+        # 初始化机械臂
+        if not args.dry_run:
+            self._enable_robot()
 
-        # 检查是否达到最大步数
-        if self.step_count >= self.args.max_steps:
-            logging.info(f"Reached max steps ({self.args.max_steps}), stopping...")
-            self.inference_enabled = False
-            return
+        # 初始化夹爪
+        self.gripper_comm = GripperComm(self.node)
 
-        # 获取图像
-        try:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        except Exception as e:
-            logging.error(f"Image conversion failed: {e}")
-            return
+        # 夹爪目标位置引用（用于状态反馈线程读取）
+        self.gripper_target_pos = [1000.0]  # 初始为张开状态
 
-        self.latest_image = cv_image
+        # 启动夹爪状态反馈线程
+        self.gripper_feedback = GripperStateFeedback(
+            self.node, self.gripper_comm, self.gripper_target_pos
+        )
+        self.gripper_feedback.start()
 
-        # 非阻塞入队：如果队列满了，丢弃旧帧
-        try:
-            self.inference_queue.put_nowait(cv_image)
-        except queue.Full:
-            # 队列满，丢弃当前帧（推理线程处理不过来）
-            pass
+        # 推理相关状态
+        self.policy_client = None
+        self.action_queue = deque()
+        self.step_count = 0
+        self.inference_enabled = False
 
-    def _build_observation(self, cv_image: np.ndarray):
+        logging.info("=== 推理客户端初始化完成 ===")
+        logging.info(f"策略服务器: {args.host}:{args.port}")
+        logging.info(f"任务提示: {args.prompt}")
+        logging.info(f"重规划步数: {args.replan_steps}")
+        logging.info(f"最大步数: {args.max_steps}")
+        logging.info(f"空运行模式: {args.dry_run}")
+
+    def _enable_robot(self):
+        """使能机器人"""
+        logging.info("Waiting for robot services...")
+        self.node.cli_enable.wait_for_service(timeout_sec=10.0)
+        self.node.cli_clear_error.wait_for_service(timeout_sec=10.0)
+        self.node.cli_speed_factor.wait_for_service(timeout_sec=10.0)
+        self.node.cli_servo_p.wait_for_service(timeout_sec=10.0)
+        self.node.cli_get_pose.wait_for_service(timeout_sec=10.0)
+
+        logging.info("Clearing errors...")
+        self.node.call_service(self.node.cli_clear_error, ClearError.Request())
+
+        logging.info("Setting speed factor to 100%...")
+        req = SpeedFactor.Request()
+        req.ratio = 100
+        self.node.call_service(self.node.cli_speed_factor, req)
+
+        logging.info("Enabling robot...")
+        self.node.call_service(self.node.cli_enable, EnableRobot.Request())
+
+        logging.info("Robot enabled")
+
+    def connect_policy_server(self):
+        """连接策略服务器"""
+        logging.info(f"Connecting to policy server at {self.args.host}:{self.args.port}...")
+        self.policy_client = _websocket_client_policy.WebsocketClientPolicy(
+            self.args.host, self.args.port
+        )
+        logging.info("Connected to policy server")
+
+        # 获取服务器元数据
+        metadata = self.policy_client.get_server_metadata()
+        logging.info(f"Server metadata: {metadata}")
+
+    def ServoP(self, x, y, z, rx, ry, rz):
+        """
+        发送ServoP伺服运动指令
+
+        异步发送，不等待执行结果，以保证高频控制不被阻塞。
+
+        Args:
+            x, y, z: 目标位置 (mm)
+            rx, ry, rz: 目标姿态 (度)
+        """
+        req = ServoP.Request()
+        req.x, req.y, req.z = float(x), float(y), float(z)
+        req.rx, req.ry, req.rz = float(rx), float(ry), float(rz)
+        self.node.call_service_async_no_wait(self.node.cli_servo_p, req)
+
+    def set_gripper(self, position):
+        """
+        设置夹爪目标位置
+
+        Args:
+            position: 目标位置，范围0-1000 (0=全开，1000=全闭)
+        """
+        self.gripper_target_pos[0] = float(position)
+        self.gripper_comm.write_reg(259, 1, str(int(position)), wait=False)
+
+    def get_current_pose(self):
+        """
+        获取机械臂当前位姿
+
+        Returns:
+            numpy array [x, y, z, rx, ry, rz] 或 None
+        """
+        req = GetPose.Request()
+        res = self.node.call_service(self.node.cli_get_pose, req)
+        if res:
+            try:
+                # 解析响应字符串
+                matches = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", str(res.pose))
+                if len(matches) >= 6:
+                    return np.array([float(x) for x in matches[:6]], dtype=np.float32)
+            except Exception:
+                pass
+        return None
+
+    def publish_robot_target(self, pose):
+        """
+        发布机械臂目标姿态
+
+        Args:
+            pose: 目标姿态 [x, y, z, rx, ry, rz]
+        """
+        msg = ToolVectorActual()
+        msg.header.stamp = self.node.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
+        msg.x = float(pose[0])
+        msg.y = float(pose[1])
+        msg.z = float(pose[2])
+        msg.rx = float(pose[3])
+        msg.ry = float(pose[4])
+        msg.rz = float(pose[5])
+        self.node.pub_robot_target.publish(msg)
+
+    def _build_observation(self):
         """构建观测数据"""
-        # 检查机器人状态是否就绪
-        if self.robot_state is None:
+        if self.node.robot_state is None:
             logging.warning("Robot state not available")
             return None
 
-        # 检查夹爪控制器是否就绪
-        if not hasattr(self, "gripper_controller"):
-            logging.warning("Gripper controller not available")
+        if self.node.latest_image is None:
+            logging.warning("Image not available")
             return None
 
         # 图像预处理：BGR→RGB，resize到224x224
-        if self.step_count == 0:
-            logging.info("Building first observation...")
-        img = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+        img = cv2.cvtColor(self.node.latest_image, cv2.COLOR_BGR2RGB)
         img = image_tools.resize_with_pad(img, self.args.resize_size, self.args.resize_size)
         img = image_tools.convert_to_uint8(img)
 
         # 夹爪状态归一化 (0-1000 -> 0-1)
-        gripper_normalized = self.gripper_controller.current_pos / 1000.0
+        gripper_normalized = self.gripper_target_pos[0] / 1000.0
 
         # 状态向量：[x,y,z,rx,ry,rz,gripper_normalized]
-        # 位置单位：mm，旋转单位：度
         state = np.concatenate(
-            [self.robot_state, [gripper_normalized]]  # (6,)  # (1,)
+            [self.node.robot_state, [gripper_normalized]]
         ).astype(np.float32)
 
         return {
             "observation/image": img,
-            "observation/wrist_image": img,  # 复用主相机（没有腕部相机）
+            "observation/wrist_image": img,
             "observation/state": state,
             "prompt": self.args.prompt,
         }
 
     def _get_action(self, obs: dict):
         """获取动作（使用动作队列 + 重规划）"""
-        # 如果动作队列为空，调用策略推理
         if not self.action_queue:
             try:
                 if self.step_count == 0:
@@ -393,7 +669,7 @@ class CR5InferenceNode(Node):
                 result = self.policy_client.infer(obs)
                 if self.step_count == 0:
                     logging.info("First inference completed!")
-                actions = result["actions"]  # (action_horizon, 7)
+                actions = result["actions"]
 
                 # 只取前replan_steps个动作
                 for i in range(min(self.args.replan_steps, len(actions))):
@@ -403,7 +679,6 @@ class CR5InferenceNode(Node):
                 logging.error(f"Inference failed: {e}")
                 return None
 
-        # 从队列取出一个动作
         if self.action_queue:
             return self.action_queue.popleft()
         return None
@@ -411,9 +686,6 @@ class CR5InferenceNode(Node):
     def _execute_action(self, action: np.ndarray):
         """执行动作"""
         # action: (7,) [x,y,z,rx,ry,rz,gripper]
-        # 注意：模型输出的动作已经是反归一化后的原始值！
-
-        # 1. 提取目标位姿（单位：mm, 度）
         target_pose = [
             float(action[0]),
             float(action[1]),
@@ -423,87 +695,79 @@ class CR5InferenceNode(Node):
             float(action[5]),
         ]
 
-        # 2. 提取夹爪目标（模型输出已经是原始值 280-1000，不需要再乘1000）
         gripper_raw = float(action[6])
         gripper_target = int(np.clip(gripper_raw, 0, 1000))
 
-        # 每100步打印一次原始动作值用于调试
         if self.step_count % 100 == 0:
-            logging.info(f"Action[{self.step_count}]: gripper_raw={gripper_raw:.1f}, gripper_target={gripper_target}")
+            logging.info(
+                f"Action[{self.step_count}]: gripper_raw={gripper_raw:.1f}, gripper_target={gripper_target}"
+            )
 
         if self.args.dry_run:
-            # 空运行模式：只打印
-            logging.info(
-                f"[DRY RUN] pose={target_pose}, gripper={gripper_target}"
-            )
+            logging.info(f"[DRY RUN] pose={target_pose}, gripper={gripper_target}")
             return
 
-        # 3. 发送ServoP指令
-        self._servo_p(*target_pose)
+        # 发送ServoP指令
+        self.ServoP(*target_pose)
 
-        # 4. 发布目标位姿话题
-        self._publish_robot_target(*target_pose)
+        # 发布目标位姿话题
+        self.publish_robot_target(target_pose)
 
-        # 5. 设置夹爪目标
-        self.gripper_controller.set_target(gripper_target)
+        # 设置夹爪目标
+        self.set_gripper(gripper_target)
 
-        # 6. 发布夹爪状态话题
-        self._publish_gripper_state()
+    def run(self):
+        """
+        运行推理主循环
 
-    def _servo_p(self, x, y, z, rx, ry, rz):
-        """发送ServoP指令"""
-        req = ServoP.Request()
-        req.x, req.y, req.z = float(x), float(y), float(z)
-        req.rx, req.ry, req.rz = float(rx), float(ry), float(rz)
-        self.call_service(self.cli_servo_p, req)
+        按30Hz频率（图像到达频率）执行推理：
+        1. 等待新图像到达
+        2. 构建观测数据
+        3. 获取动作（调用策略服务器或从队列取出）
+        4. 执行动作（ServoP + 夹爪控制）
+        5. 发布目标状态话题
+        """
+        logging.info("\n=== 开始推理 ===")
+        logging.info("按 Ctrl+C 停止\n")
 
-    def _publish_robot_target(self, x, y, z, rx, ry, rz):
-        """发布机器人目标位姿"""
-        msg = ToolVectorActual()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "base_link"
-        msg.x, msg.y, msg.z = float(x), float(y), float(z)
-        msg.rx, msg.ry, msg.rz = float(rx), float(ry), float(rz)
-        self.pub_robot_target.publish(msg)
+        # 等待初始数据
+        logging.info("Waiting for camera and robot data...")
+        wait_start = time.time()
+        while self.node.robot_state is None or self.node.latest_image is None:
+            if time.time() - wait_start > 10.0:
+                logging.error("Timeout waiting for sensor data")
+                raise RuntimeError("Sensor data not available")
+            time.sleep(0.1)
+        logging.info("Sensor data available")
 
-    def _publish_gripper_state(self):
-        """发布夹爪状态（目标和实际）"""
-        now = self.get_clock().now().to_msg()
+        # 获取初始位姿
+        if not self.args.dry_run:
+            initial_pose = self.get_current_pose()
+            if initial_pose is not None:
+                logging.info(f"Initial pose: {initial_pose}")
+            else:
+                logging.warning("Could not get initial pose")
 
-        # 发布目标状态
-        msg_target = PointStamped()
-        msg_target.header.stamp = now
-        msg_target.header.frame_id = "gripper_command"
-        msg_target.point.x = float(self.gripper_controller.target_pos)
-        self.pub_gripper_target.publish(msg_target)
+        # 连接策略服务器
+        self.connect_policy_server()
 
-        # 发布实际状态
-        msg_current = PointStamped()
-        msg_current.header.stamp = now
-        msg_current.header.frame_id = "gripper_feedback"
-        msg_current.point.x = float(self.gripper_controller.current_pos)
-        self.pub_gripper_state.publish(msg_current)
+        self.inference_enabled = True
+        start_time = time.time()
+        last_image = None
 
-    def _inference_loop(self):
-        """推理线程主循环 - 独立线程中运行"""
-        logging.info("Inference thread started")
+        try:
+            while self.inference_enabled and self.step_count < self.args.max_steps:
+                loop_start = time.time()
 
-        while self.inference_running and self.inference_enabled:
-            try:
-                # 从队列获取图像（阻塞，超时1秒）
-                try:
-                    cv_image = self.inference_queue.get(timeout=1.0)
-                except queue.Empty:
+                # 等待新图像（30Hz）
+                current_image = self.node.latest_image
+                if current_image is last_image:
+                    time.sleep(0.001)
                     continue
-
-                # 检查是否需要停止
-                if self.step_count >= self.args.max_steps:
-                    logging.info(f"Reached max steps ({self.args.max_steps}), stopping...")
-                    self.inference_enabled = False
-                    break
+                last_image = current_image
 
                 # 构建观测
-                obs = self._build_observation(cv_image)
+                obs = self._build_observation()
                 if obs is None:
                     continue
 
@@ -516,185 +780,65 @@ class CR5InferenceNode(Node):
                 self._execute_action(action)
                 self.step_count += 1
 
-                # 定期打印状态
+                # 打印进度（每30帧）
                 if self.step_count % 30 == 0:
+                    elapsed = time.time() - start_time
+                    fps = self.step_count / elapsed if elapsed > 0 else 0
                     logging.info(
                         f"Step {self.step_count}, "
-                        f"action queue: {len(self.action_queue)}, "
-                        f"image queue: {self.inference_queue.qsize()}"
+                        f"elapsed: {elapsed:.1f}s, "
+                        f"fps: {fps:.1f}, "
+                        f"action queue: {len(self.action_queue)}"
                     )
 
-            except Exception as e:
-                logging.error(f"Error in inference loop: {e}", exc_info=True)
-                time.sleep(0.1)
+            logging.info(f"\n=== 推理完成 ===")
+            logging.info(f"总步数: {self.step_count}")
+            logging.info(f"总耗时: {time.time() - start_time:.2f}s")
 
-        logging.info("Inference thread stopped")
+        except KeyboardInterrupt:
+            logging.info("\n\n=== 推理被中断 ===")
 
-    def start_inference_thread(self):
-        """启动推理线程"""
-        if self.inference_thread is not None:
-            logging.warning("Inference thread already running")
-            return
+        # 等待夹爪到达最终位置
+        logging.info("等待夹爪到达最终位置...")
+        time.sleep(1.0)
 
-        self.inference_running = True
-        self.inference_thread = threading.Thread(
-            target=self._inference_loop,
-            daemon=True,
-            name="InferenceThread"
-        )
-        self.inference_thread.start()
-        logging.info("Inference thread launched")
+    def close(self):
+        """
+        关闭推理客户端并清理资源
 
-    def stop_inference_thread(self):
-        """停止推理线程"""
-        if self.inference_thread is None:
-            return
-
-        logging.info("Stopping inference thread...")
-        self.inference_running = False
-
-        # 等待线程结束，设置合理的超时
-        if self.inference_thread.is_alive():
-            self.inference_thread.join(timeout=3.0)
-            if self.inference_thread.is_alive():
-                logging.warning("Inference thread did not stop gracefully")
-
-        self.inference_thread = None
-        logging.info("Inference thread stopped")
-
-    def enable_robot(self):
-        """使能机器人"""
-        logging.info("Waiting for robot services...")
-        self.cli_enable.wait_for_service(timeout_sec=10.0)
-        self.cli_clear_error.wait_for_service(timeout_sec=10.0)
-        self.cli_speed_factor.wait_for_service(timeout_sec=10.0)
-        self.cli_servo_p.wait_for_service(timeout_sec=10.0)
-        self.cli_get_pose.wait_for_service(timeout_sec=10.0)
-
-        logging.info("Clearing errors...")
-        self.call_service(self.cli_clear_error, ClearError.Request())
-
-        logging.info("Setting speed factor to 100%...")
-        req = SpeedFactor.Request()
-        req.ratio = 100
-        self.call_service(self.cli_speed_factor, req)
-
-        logging.info("Enabling robot...")
-        self.call_service(self.cli_enable, EnableRobot.Request())
-
-        logging.info("Robot enabled")
-
-    def get_current_pose(self):
-        """获取当前位姿"""
-        res = self.call_service(self.cli_get_pose, GetPose.Request())
-        if res and hasattr(res, "pose"):
-            matches = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", res.pose)
-            if len(matches) >= 6:
-                return [float(x) for x in matches[:6]]
-        return None
-
-
-def run_inference(args: Args):
-    """运行推理主循环"""
-    logging.info("=" * 60)
-    logging.info("CR5 Inference Client")
-    logging.info("=" * 60)
-    logging.info(f"Server: {args.host}:{args.port}")
-    logging.info(f"Prompt: {args.prompt}")
-    logging.info(f"Replan steps: {args.replan_steps}")
-    logging.info(f"Max steps: {args.max_steps}")
-    logging.info(f"Dry run: {args.dry_run}")
-    logging.info("=" * 60)
-
-    # 初始化ROS2
-    rclpy.init()
-
-    # 创建节点
-    node = CR5InferenceNode(args)
-
-    # 启动ROS2 spin线程
-    spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
-    spin_thread.start()
-
-    try:
-        # 使能机器人
-        if not args.dry_run:
-            node.enable_robot()
-
-        # 初始化夹爪控制器
-        logging.info("Initializing gripper controller...")
-        node.gripper_controller = GripperController(node)
-        node.gripper_controller.start()
-
-        # 等待初始数据
-        logging.info("Waiting for camera and robot data...")
-        wait_start = time.time()
-        while node.robot_state is None or node.latest_image is None:
-            if time.time() - wait_start > 10.0:
-                logging.error("Timeout waiting for sensor data")
-                raise RuntimeError("Sensor data not available")
-            time.sleep(0.1)
-        logging.info("Sensor data available")
-
-        # 获取初始位姿
-        if not args.dry_run:
-            initial_pose = node.get_current_pose()
-            if initial_pose:
-                logging.info(f"Initial pose: {initial_pose}")
-            else:
-                logging.warning("Could not get initial pose")
-
-        # 连接策略服务器
-        logging.info(f"Connecting to policy server at {args.host}:{args.port}...")
-        node.policy_client = _websocket_client_policy.WebsocketClientPolicy(
-            args.host, args.port
-        )
-        logging.info("Connected to policy server")
-
-        # 获取服务器元数据
-        metadata = node.policy_client.get_server_metadata()
-        logging.info(f"Server metadata: {metadata}")
-
-        # 开始推理
-        logging.info("=" * 60)
-        logging.info("Starting inference... Press Ctrl+C to stop")
-        logging.info("=" * 60)
-        node.inference_enabled = True
-
-        # 启动推理线程
-        node.start_inference_thread()
-
-        # 主循环 - 等待推理完成或用户中断
-        while node.inference_enabled and rclpy.ok():
-            time.sleep(0.1)
-
-        logging.info(f"Inference stopped after {node.step_count} steps")
-
-    except KeyboardInterrupt:
-        logging.info("Interrupted by user")
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        raise
-    finally:
-        # 停止推理线程
-        if hasattr(node, "inference_thread"):
-            node.stop_inference_thread()
-
-        # 停止夹爪控制器
-        if hasattr(node, "gripper_controller"):
-            node.gripper_controller.stop()
-            node.gripper_controller.join(timeout=1.0)
-
-        # 关闭节点
-        node.destroy_node()
+        步骤：
+        1. 停止夹爪状态反馈线程
+        2. 等待线程结束
+        3. 关闭ROS节点
+        """
+        self.gripper_feedback.running = False
+        self.gripper_feedback.join(timeout=1.0)
+        self.node.destroy_node()
         rclpy.shutdown()
+
+
+def main():
+    """
+    主函数：命令行入口
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+    args = tyro.cli(Args)
+
+    # 创建推理客户端
+    client = InferenceClient(args)
+
+    # 运行推理
+    client.run()
+
+    # 关闭
+    client.close()
 
     logging.info("Done")
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
-    tyro.cli(run_inference)
+    main()
