@@ -93,6 +93,7 @@ class Args:
     dry_run: bool = False  # 空运行模式：只打印动作，不执行
     blocking_servo: Union[bool, str] = 'last_blocking'  # 阻塞执行模式：'last_blocking'=最后一个动作阻塞，'hybrid'=Index0阻塞，True=全阻塞，False=全非阻塞
     observation_delay_ms: int = 0  # 观测前延迟(ms)，等待ServoP部分完成再读取状态
+    inference_delay_ms: int = 0  # 推理前等待摄像头延迟(ms)
 
     # 数据记录参数
     record: bool = False  # 是否启用数据记录
@@ -1691,6 +1692,10 @@ class InferenceClient:
                 # 强制忽略以避免误用导致震荡
                 if self.args.observation_delay_ms > 0 and not use_rate_limit:
                     time.sleep(self.args.observation_delay_ms / 1000.0)
+
+                # 推理前等待摄像头延迟
+                if self.args.inference_delay_ms > 0:
+                    time.sleep(self.args.inference_delay_ms / 1000.0)
 
                 # 构建观测
                 t0 = time.time()
