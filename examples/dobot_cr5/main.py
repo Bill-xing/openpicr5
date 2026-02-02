@@ -31,6 +31,7 @@ python examples/dobot_cr5/main.py --host localhost --port 8000 --prompt "pick up
 import dataclasses
 from datetime import datetime
 import logging
+import multiprocessing as mp
 import pathlib
 import re
 import threading
@@ -44,6 +45,8 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.qos import (
     QoSDurabilityPolicy,
     QoSHistoryPolicy,
@@ -331,6 +334,249 @@ class DataLogger:
         self.save()
 
 
+# ============================================================================
+# ServoP 独立进程（关键：完全隔离 ROS 上下文，避免图像订阅干扰）
+# ============================================================================
+
+def servo_process_worker(cmd_queue: mp.Queue, result_queue: mp.Queue, stop_event: mp.Event):
+    """
+    ServoP 独立进程工作函数（高频持续发送模式）
+
+    关键：持续以高频（100Hz）发送 ServoP 指令，即使没有新命令也重复发送上一个位姿。
+    这样可以让 Dobot 控制器保持在"连续伺服模式"，响应时间降到 ~11ms。
+
+    Args:
+        cmd_queue: 接收目标位姿的队列 [x, y, z, rx, ry, rz]
+        result_queue: 返回执行结果的队列 {'elapsed_ms': float, 'success': bool}
+        stop_event: 停止信号
+    """
+    # 配置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [ServoProcess] %(message)s",
+    )
+
+    # 独立初始化 rclpy（关键！这是一个完全独立的 ROS 上下文）
+    rclpy.init()
+    logging.info("ServoProcess: rclpy 独立初始化完成")
+
+    # 创建节点
+    node = rclpy.create_node("servo_process_node")
+    cli_servo_p = node.create_client(ServoP, "/dobot_bringup_v3/srv/ServoP")
+
+    logging.info("ServoProcess: 等待 ServoP 服务...")
+    if not cli_servo_p.wait_for_service(timeout_sec=10.0):
+        logging.error("ServoProcess: ServoP 服务未就绪，退出")
+        rclpy.shutdown()
+        return
+
+    logging.info("ServoProcess: ServoP 服务已就绪")
+
+    # 启动 spin 线程
+    spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    spin_thread.start()
+    logging.info("ServoProcess: spin 线程已启动")
+
+    # 性能统计
+    call_count = 0
+    total_time = 0.0
+    min_time = float('inf')
+    max_time = 0.0
+
+    # 当前目标位姿（持续发送）
+    current_pose = None
+    pending_result = False  # 是否有等待返回的结果
+
+    # 主循环：持续高频发送 ServoP
+    while not stop_event.is_set():
+        try:
+            # 非阻塞检查是否有新命令
+            try:
+                new_pose = cmd_queue.get_nowait()
+                if new_pose is None:  # 停止信号
+                    break
+                current_pose = new_pose
+                pending_result = True  # 标记需要返回结果
+            except:
+                pass  # 没有新命令，继续使用当前位姿
+
+            # 如果还没有初始位姿，等待
+            if current_pose is None:
+                time.sleep(0.01)
+                continue
+
+            # 构建请求
+            req = ServoP.Request()
+            req.x, req.y, req.z = float(current_pose[0]), float(current_pose[1]), float(current_pose[2])
+            req.rx, req.ry, req.rz = float(current_pose[3]), float(current_pose[4]), float(current_pose[5])
+
+            # 调用 ServoP（手动轮询，与 data_collector4.py 一致）
+            start_time = time.time()
+            if cli_servo_p.service_is_ready():
+                future = cli_servo_p.call_async(req)
+                while not future.done():
+                    time.sleep(0.001)
+            elapsed_ms = (time.time() - start_time) * 1000
+
+            # 更新统计
+            call_count += 1
+            total_time += elapsed_ms
+            min_time = min(min_time, elapsed_ms)
+            max_time = max(max_time, elapsed_ms)
+
+            # 如果有等待返回的结果，返回给主进程
+            if pending_result:
+                result_queue.put({'elapsed_ms': elapsed_ms, 'success': True})
+                pending_result = False
+
+            # 每 100 次打印统计
+            if call_count % 100 == 0:
+                avg_time = total_time / call_count
+                logging.info(
+                    f"ServoP 统计: Count={call_count}, "
+                    f"Avg={avg_time:.1f}ms, Min={min_time:.1f}ms, Max={max_time:.1f}ms"
+                )
+
+        except Exception as e:
+            logging.error(f"ServoProcess 错误: {e}")
+            if pending_result:
+                result_queue.put({'elapsed_ms': 0, 'success': False})
+                pending_result = False
+
+    # 清理
+    logging.info("ServoProcess: 正在关闭...")
+    node.destroy_node()
+    rclpy.shutdown()
+    logging.info("ServoProcess: 已关闭")
+
+
+class ServoNode(Node):
+    """
+    ServoP 专用节点
+
+    完全独立的 ROS 节点，只负责 ServoP 服务调用。
+    参考 data_collector4.py 的架构：没有订阅器，spin 线程只处理服务响应。
+    这样可以确保 ServoP 调用延迟最小化（~11ms）。
+    """
+
+    def __init__(self, node_name="servo_node"):
+        super().__init__(node_name)
+
+        # 只有 ServoP 服务客户端，没有任何订阅器
+        self.cli_servo_p = self.create_client(ServoP, "/dobot_bringup_v3/srv/ServoP")
+        self.cli_servo_p_no_wait = self.create_client(
+            ServoPNoWait, "/dobot_bringup_v3/srv/ServoPNoWait"
+        )
+
+        self.get_logger().info("ServoNode: 等待 ServoP 服务...")
+        if not self.cli_servo_p.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn("ServoNode: ServoP 服务未就绪")
+
+    def call_service_blocking(self, client, request):
+        """
+        同步调用服务（使用 spin_until_future_complete，更高效）
+
+        注意：这个方法会在当前线程中 spin，不需要单独的 spin 线程
+        """
+        if not client.service_is_ready():
+            return None
+        future = client.call_async(request)
+        rclpy.spin_until_future_complete(self, future)
+        return future.result()
+
+    def call_service(self, client, request):
+        """同步调用服务（轮询方式，需要单独的 spin 线程）"""
+        if not client.service_is_ready():
+            return None
+        future = client.call_async(request)
+        while not future.done():
+            time.sleep(0.001)
+        return future.result()
+
+    def call_service_async_no_wait(self, client, request):
+        """异步调用，不等待结果"""
+        if client.service_is_ready():
+            client.call_async(request)
+
+
+class ServoPThread(threading.Thread):
+    """
+    ServoP 高频发送线程
+
+    参考 data_collector4.py 的工作模式：
+    - 以尽可能高的频率（目标100Hz）持续发送 ServoP 指令
+    - 这样可以让 Dobot 控制器进入"连续伺服模式"，响应时间从 ~100ms 降到 ~11ms
+
+    工作原理：
+    - 主推理循环更新 target_pose（30Hz）
+    - 本线程持续读取 target_pose 并发送给控制器（100Hz）
+    - 即使 ServoP 阻塞，也不会影响主推理循环
+    """
+
+    def __init__(self, servo_node: ServoNode):
+        super().__init__(daemon=True)
+        self.servo_node = servo_node
+        self.running = True
+
+        # 目标位姿（由主线程更新）
+        self.target_pose = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        self.pose_lock = threading.Lock()
+        self.pose_updated = False  # 标记是否有新位姿
+
+        # 性能统计
+        self.call_count = 0
+        self.total_time = 0.0
+        self.min_time = float('inf')
+        self.max_time = 0.0
+
+    def set_target_pose(self, pose):
+        """主线程调用此方法更新目标位姿"""
+        with self.pose_lock:
+            self.target_pose = list(pose)
+            self.pose_updated = True
+
+    def run(self):
+        """高频发送 ServoP 指令（完全复制 data_collector4.py 的模式）"""
+        logging.info("[ServoPThread] 启动，使用专用 spin 线程 + 手动轮询")
+
+        # 关键：启动专用的 spin 线程（与 data_collector4.py 完全一致）
+        spin_thread = threading.Thread(
+            target=rclpy.spin, args=(self.servo_node,), daemon=True
+        )
+        spin_thread.start()
+        logging.info("[ServoPThread] 专用 spin 线程已启动")
+
+        while self.running:
+            # 获取当前目标位姿
+            with self.pose_lock:
+                pose = self.target_pose.copy()
+
+            # 构建请求
+            req = ServoP.Request()
+            req.x, req.y, req.z = float(pose[0]), float(pose[1]), float(pose[2])
+            req.rx, req.ry, req.rz = float(pose[3]), float(pose[4]), float(pose[5])
+
+            # 发送 ServoP（使用手动轮询，与 data_collector4.py 完全一致）
+            start_time = time.time()
+            self.servo_node.call_service(self.servo_node.cli_servo_p, req)
+            elapsed = (time.time() - start_time) * 1000  # ms
+
+            # 更新统计
+            self.call_count += 1
+            self.total_time += elapsed
+            self.min_time = min(self.min_time, elapsed)
+            self.max_time = max(self.max_time, elapsed)
+
+            # 每 100 次打印统计
+            if self.call_count % 100 == 0:
+                avg_time = self.total_time / self.call_count
+                logging.info(
+                    f"[ServoPThread] Count: {self.call_count}, "
+                    f"Avg: {avg_time:.2f}ms, Min: {self.min_time:.2f}ms, "
+                    f"Max: {self.max_time:.2f}ms, Current: {elapsed:.2f}ms"
+                )
+
+
 class DobotRosWrapper(Node):
     """
     机械臂ROS接口封装
@@ -356,34 +602,50 @@ class DobotRosWrapper(Node):
         """
         super().__init__(node_name)
 
-        # === 机械臂控制服务客户端 ===
+        # === 回调组配置（确保服务和订阅在不同线程执行）===
+        # 其他服务回调组：Modbus、GetPose等
+        self.service_cb_group = MutuallyExclusiveCallbackGroup()
+        # 图像回调组：单独处理耗时的图像数据
+        self.image_cb_group = MutuallyExclusiveCallbackGroup()
+        # 状态回调组：处理机器人状态
+        self.state_cb_group = MutuallyExclusiveCallbackGroup()
+
+        # === 注意：ServoP 已移至独立的 ServoNode ===
+
+        # === 其他机械臂控制服务客户端（使用服务回调组）===
         self.cli_enable = self.create_client(
-            EnableRobot, "/dobot_bringup_v3/srv/EnableRobot"
+            EnableRobot, "/dobot_bringup_v3/srv/EnableRobot",
+            callback_group=self.service_cb_group
         )
         self.cli_clear_error = self.create_client(
-            ClearError, "/dobot_bringup_v3/srv/ClearError"
+            ClearError, "/dobot_bringup_v3/srv/ClearError",
+            callback_group=self.service_cb_group
         )
         self.cli_speed_factor = self.create_client(
-            SpeedFactor, "/dobot_bringup_v3/srv/SpeedFactor"
+            SpeedFactor, "/dobot_bringup_v3/srv/SpeedFactor",
+            callback_group=self.service_cb_group
         )
-        self.cli_servo_p = self.create_client(ServoP, "/dobot_bringup_v3/srv/ServoP")
-        self.cli_servo_p_no_wait = self.create_client(
-            ServoPNoWait, "/dobot_bringup_v3/srv/ServoPNoWait"
+        self.cli_get_pose = self.create_client(
+            GetPose, "/dobot_bringup_v3/srv/GetPose",
+            callback_group=self.service_cb_group
         )
-        self.cli_get_pose = self.create_client(GetPose, "/dobot_bringup_v3/srv/GetPose")
 
-        # === Modbus通信服务客户端（用于夹爪控制）===
+        # === Modbus通信服务客户端（使用服务回调组）===
         self.cli_modbus_create = self.create_client(
-            ModbusCreate, "/dobot_bringup_v3/srv/ModbusCreate"
+            ModbusCreate, "/dobot_bringup_v3/srv/ModbusCreate",
+            callback_group=self.service_cb_group
         )
         self.cli_modbus_close = self.create_client(
-            ModbusClose, "/dobot_bringup_v3/srv/ModbusClose"
+            ModbusClose, "/dobot_bringup_v3/srv/ModbusClose",
+            callback_group=self.service_cb_group
         )
         self.cli_set_hold_regs = self.create_client(
-            SetHoldRegs, "/dobot_bringup_v3/srv/SetHoldRegs"
+            SetHoldRegs, "/dobot_bringup_v3/srv/SetHoldRegs",
+            callback_group=self.service_cb_group
         )
         self.cli_get_hold_regs = self.create_client(
-            GetHoldRegs, "/dobot_bringup_v3/srv/GetHoldRegs"
+            GetHoldRegs, "/dobot_bringup_v3/srv/GetHoldRegs",
+            callback_group=self.service_cb_group
         )
 
         # === 话题发布器 ===
@@ -411,23 +673,27 @@ class DobotRosWrapper(Node):
             depth=10,
         )
 
-        # === 话题订阅器（用于推理）===
+        # === 话题订阅器（用于推理，使用独立回调组）===
         self.robot_state = None
         self.latest_image = None
         self.bridge = CvBridge()
 
+        # 图像订阅：使用图像回调组（耗时操作，独立线程处理）
         self.sub_image = self.create_subscription(
-            Image, "/camera/color/image_raw", self._image_callback, sensor_qos
+            Image, "/camera/color/image_raw", self._image_callback, sensor_qos,
+            callback_group=self.image_cb_group
         )
+        # 状态订阅：使用状态回调组
         self.sub_robot_current = self.create_subscription(
             ToolVectorActual,
             "/dobot_msgs_v3/msg/ToolVectorActual",
             self._robot_current_callback,
             robot_qos,
+            callback_group=self.state_cb_group
         )
 
         self.get_logger().info("等待Dobot服务...")
-        if not self.cli_servo_p.wait_for_service(timeout_sec=5.0):
+        if not self.cli_enable.wait_for_service(timeout_sec=5.0):
             self.get_logger().warn("Dobot服务未就绪")
 
     def _image_callback(self, msg: Image):
@@ -743,21 +1009,59 @@ class InferenceClient:
         """
         self.args = args
 
-        # 初始化ROS
+        # 初始化ROS（主进程）
         if not rclpy.ok():
             rclpy.init()
 
+        # === ServoP 独立进程（关键：完全隔离 ROS 上下文）===
+        logging.info("启动 ServoP 独立进程...")
+        self.servo_cmd_queue = mp.Queue()
+        self.servo_result_queue = mp.Queue()
+        self.servo_stop_event = mp.Event()
+        self.servo_process = mp.Process(
+            target=servo_process_worker,
+            args=(self.servo_cmd_queue, self.servo_result_queue, self.servo_stop_event),
+            daemon=True
+        )
+        self.servo_process.start()
+        logging.info(f"ServoP 独立进程已启动 (PID: {self.servo_process.pid})")
+
+        # 等待 ServoP 进程就绪
+        time.sleep(2.0)
+
+        # === 主节点：处理图像、状态订阅和其他服务 ===
         self.node = DobotRosWrapper()
 
-        # ROS Spin线程
+        # ROS Spin线程（使用多线程执行器处理图像和状态订阅）
+        self.executor = MultiThreadedExecutor(num_threads=4)
+        self.executor.add_node(self.node)
         self.spin_thread = threading.Thread(
-            target=rclpy.spin, args=(self.node,), daemon=True
+            target=self.executor.spin, daemon=True
         )
         self.spin_thread.start()
 
-        # 初始化机械臂
+        # 初始化机械臂（使用主节点的服务）
         if not args.dry_run:
             self._enable_robot()
+
+            # 获取初始位姿并发送给 ServoP 进程（让它开始持续发送）
+            initial_pose = self.get_current_pose()
+            if initial_pose is not None:
+                logging.info(f"发送初始位姿到 ServoP 进程: {initial_pose}")
+                self.servo_cmd_queue.put(list(initial_pose))
+                # 清空可能的返回结果
+                try:
+                    self.servo_result_queue.get(timeout=0.5)
+                except:
+                    pass
+
+        # ServoP 性能统计
+        self.servo_stats = {
+            'count': 0,
+            'total_time': 0.0,
+            'min_time': float('inf'),
+            'max_time': 0.0,
+        }
 
         # 初始化夹爪
         self.gripper_comm = GripperComm(self.node)
@@ -818,7 +1122,7 @@ class InferenceClient:
         self.node.cli_enable.wait_for_service(timeout_sec=10.0)
         self.node.cli_clear_error.wait_for_service(timeout_sec=10.0)
         self.node.cli_speed_factor.wait_for_service(timeout_sec=10.0)
-        self.node.cli_servo_p.wait_for_service(timeout_sec=10.0)
+        # 注意：ServoP 在独立进程中，不需要在这里等待
         self.node.cli_get_pose.wait_for_service(timeout_sec=10.0)
 
         logging.info("Clearing errors...")
@@ -1185,40 +1489,25 @@ class InferenceClient:
             logging.info(f"[DRY RUN] pose={target_pose}, gripper={gripper_target}")
             return
 
-        # 发送ServoP指令（支持hybrid模式）
-        req = ServoP.Request()
-        req.x, req.y, req.z = float(target_pose[0]), float(target_pose[1]), float(target_pose[2])
-        req.rx, req.ry, req.rz = float(target_pose[3]), float(target_pose[4]), float(target_pose[5])
-
-        # ServoPNoWait请求（相同参数）
-        req_no_wait = ServoPNoWait.Request()
-        req_no_wait.x, req_no_wait.y, req_no_wait.z = req.x, req.y, req.z
-        req_no_wait.rx, req_no_wait.ry, req_no_wait.rz = req.rx, req.ry, req.rz
-
         t_servo_call = time.time()
 
-        if self.args.blocking_servo == 'last_blocking':
-            # last_blocking模式：只有最后一个动作阻塞
-            if action_index == self.args.replan_steps - 1:
-                # 最后一个动作：阻塞等待，确保所有动作执行完成
-                self.node.call_service(self.node.cli_servo_p, req)
-            else:
-                # 前面的动作：使用真正的ServoPNoWait
-                self.node.call_service_async_no_wait(self.node.cli_servo_p_no_wait, req_no_wait)
-        elif self.args.blocking_servo == 'hybrid':
-            # 混合模式: Index 0阻塞，其他非阻塞
-            if action_index == 0:
-                # 首帧阻塞，确保状态对齐
-                self.node.call_service(self.node.cli_servo_p, req)
-            else:
-                # 后续帧非阻塞，使用ServoPNoWait
-                self.node.call_service_async_no_wait(self.node.cli_servo_p_no_wait, req_no_wait)
-        elif self.args.blocking_servo:
-            # 全阻塞模式
-            self.node.call_service(self.node.cli_servo_p, req)
-        else:
-            # 全非阻塞模式：使用真正的ServoPNoWait
-            self.node.call_service_async_no_wait(self.node.cli_servo_p_no_wait, req_no_wait)
+        # === 通过独立进程调用 ServoP（高频持续发送模式）===
+        # 发送命令到独立进程
+        self.servo_cmd_queue.put(target_pose)
+
+        # 等待执行结果（阻塞，确保模型看到稳定状态）
+        # 由于独立进程持续高频发送 ServoP，预期延迟应该很低（~11ms）
+        try:
+            result = self.servo_result_queue.get(timeout=0.5)
+            servo_elapsed = result.get('elapsed_ms', 0)
+        except:
+            servo_elapsed = 0
+            logging.warning("ServoP 结果超时")
+
+        self.servo_stats['count'] += 1
+        self.servo_stats['total_time'] += servo_elapsed
+        self.servo_stats['min_time'] = min(self.servo_stats['min_time'], servo_elapsed)
+        self.servo_stats['max_time'] = max(self.servo_stats['max_time'], servo_elapsed)
 
         t_publish = time.time()
 
@@ -1368,6 +1657,15 @@ class InferenceClient:
                         f"推理延迟: {inf_mean:.0f}ms (max:{inf_max:.0f}ms) | "
                         f"队列: {len(self.action_queue)}"
                     )
+                    # ServoP 延迟统计
+                    if self.servo_stats['count'] > 0:
+                        servo_avg = self.servo_stats['total_time'] / self.servo_stats['count']
+                        logging.info(
+                            f"  ServoP: Avg={servo_avg:.1f}ms, "
+                            f"Min={self.servo_stats['min_time']:.1f}ms, "
+                            f"Max={self.servo_stats['max_time']:.1f}ms, "
+                            f"Count={self.servo_stats['count']}"
+                        )
                     logging.info(f"  性能: {perf_str}")
 
             logging.info(f"\n=== 推理完成 ===")
@@ -1390,11 +1688,21 @@ class InferenceClient:
         关闭推理客户端并清理资源
 
         步骤：
-        1. 停止夹爪状态反馈线程
-        2. 等待线程结束
-        3. 关闭数据记录器
-        4. 关闭ROS节点
+        1. 停止 ServoP 独立进程
+        2. 停止夹爪状态反馈线程
+        3. 等待线程结束
+        4. 关闭数据记录器
+        5. 关闭执行器和ROS节点
         """
+        # 停止 ServoP 独立进程
+        logging.info("停止 ServoP 独立进程...")
+        self.servo_stop_event.set()
+        self.servo_cmd_queue.put(None)  # 发送停止信号
+        self.servo_process.join(timeout=3.0)
+        if self.servo_process.is_alive():
+            self.servo_process.terminate()
+            logging.warning("ServoP 进程被强制终止")
+
         self.gripper_feedback.running = False
         self.gripper_feedback.join(timeout=1.0)
 
@@ -1402,6 +1710,10 @@ class InferenceClient:
         if self.data_logger is not None:
             self.data_logger.close()
 
+        # 停止执行器
+        self.executor.shutdown()
+
+        # 清理节点
         self.node.destroy_node()
         rclpy.shutdown()
 
@@ -1410,6 +1722,9 @@ def main():
     """
     主函数：命令行入口
     """
+    # 设置 multiprocessing 启动方式（spawn 对 ROS2 更稳定）
+    mp.set_start_method('spawn', force=True)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
