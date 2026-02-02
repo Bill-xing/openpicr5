@@ -236,6 +236,19 @@ class CR5InferenceNode(Node):
         self.inference_enabled = False  # 推理使能标志
         self.step_count = 0  # 执行步数计数
         self.bridge = CvBridge()
+        # 推理耗时统计（用于剔除推理时间的控制频率）
+        self.inference_block_time_total = 0.0
+        self.inference_block_count = 0
+        self.inference_loop_start_time = None
+        self.last_inference_time = 0.0
+        # ServoP耗时统计
+        self.servo_stats = {
+            "count": 0,
+            "total_ms": 0.0,
+            "min_ms": float("inf"),
+            "max_ms": 0.0,
+        }
+        self.servo_warn_ms = 50.0
 
         # 推理队列（线程安全）
         self.inference_queue = queue.Queue(maxsize=2)  # 最多缓存2帧图像
@@ -386,11 +399,22 @@ class CR5InferenceNode(Node):
     def _get_action(self, obs: dict):
         """获取动作（使用动作队列 + 重规划）"""
         # 如果动作队列为空，调用策略推理
+        did_inference = False
         if not self.action_queue:
             try:
                 if self.step_count == 0:
                     logging.info("Calling policy inference for first time...")
+                t0 = time.time()
                 result = self.policy_client.infer(obs)
+                inference_time = time.time() - t0
+                self.inference_block_time_total += inference_time
+                self.inference_block_count += 1
+                self.last_inference_time = inference_time
+                did_inference = True
+                logging.info(
+                    f"[Inference] elapsed={inference_time*1000:.1f}ms "
+                    f"(step={self.step_count}, replan_steps={self.args.replan_steps})"
+                )
                 if self.step_count == 0:
                     logging.info("First inference completed!")
                 actions = result["actions"]  # (action_horizon, 7)
@@ -405,7 +429,10 @@ class CR5InferenceNode(Node):
 
         # 从队列取出一个动作
         if self.action_queue:
+            if not did_inference:
+                self.last_inference_time = 0.0
             return self.action_queue.popleft()
+        self.last_inference_time = 0.0
         return None
 
     def _execute_action(self, action: np.ndarray):
@@ -455,7 +482,24 @@ class CR5InferenceNode(Node):
         req = ServoP.Request()
         req.x, req.y, req.z = float(x), float(y), float(z)
         req.rx, req.ry, req.rz = float(rx), float(ry), float(rz)
+        start_time = time.time()
         self.call_service(self.cli_servo_p, req)
+        elapsed_ms = (time.time() - start_time) * 1000
+        self.servo_stats["count"] += 1
+        self.servo_stats["total_ms"] += elapsed_ms
+        self.servo_stats["min_ms"] = min(self.servo_stats["min_ms"], elapsed_ms)
+        self.servo_stats["max_ms"] = max(self.servo_stats["max_ms"], elapsed_ms)
+
+        if elapsed_ms >= self.servo_warn_ms:
+            logging.warning(f"[ServoP] slow call: {elapsed_ms:.1f}ms (step={self.step_count})")
+
+        if self.step_count % 30 == 0:
+            avg_ms = self.servo_stats["total_ms"] / max(1, self.servo_stats["count"])
+            logging.info(
+                f"[ServoP] elapsed={elapsed_ms:.1f}ms (step={self.step_count}) | "
+                f"avg={avg_ms:.1f}ms min={self.servo_stats['min_ms']:.1f}ms "
+                f"max={self.servo_stats['max_ms']:.1f}ms count={self.servo_stats['count']}"
+            )
 
     def _publish_robot_target(self, x, y, z, rx, ry, rz):
         """发布机器人目标位姿"""
@@ -487,6 +531,8 @@ class CR5InferenceNode(Node):
     def _inference_loop(self):
         """推理线程主循环 - 独立线程中运行"""
         logging.info("Inference thread started")
+        if self.inference_loop_start_time is None:
+            self.inference_loop_start_time = time.time()
 
         while self.inference_running and self.inference_enabled:
             try:
@@ -495,6 +541,7 @@ class CR5InferenceNode(Node):
                     cv_image = self.inference_queue.get(timeout=1.0)
                 except queue.Empty:
                     continue
+                step_start_time = time.time()
 
                 # 检查是否需要停止
                 if self.step_count >= self.args.max_steps:
@@ -516,12 +563,24 @@ class CR5InferenceNode(Node):
                 self._execute_action(action)
                 self.step_count += 1
 
+                self.last_inference_time = 0.0
+
                 # 定期打印状态
                 if self.step_count % 30 == 0:
+                    elapsed = 0.0
+                    if self.inference_loop_start_time is not None:
+                        elapsed = time.time() - self.inference_loop_start_time
+                    action_fps = self.step_count / elapsed if elapsed > 0 else 0
+                    effective_elapsed = elapsed - self.inference_block_time_total
+                    action_fps_no_inf = (
+                        self.step_count / effective_elapsed if effective_elapsed > 0 else 0
+                    )
                     logging.info(
                         f"Step {self.step_count}, "
                         f"action queue: {len(self.action_queue)}, "
-                        f"image queue: {self.inference_queue.qsize()}"
+                        f"image queue: {self.inference_queue.qsize()} | "
+                        f"动作频率: {action_fps:.1f}Hz | "
+                        f"动作频率(去推理): {action_fps_no_inf:.1f}Hz"
                     )
 
             except Exception as e:

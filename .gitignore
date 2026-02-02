@@ -197,3 +197,7 @@ dataset_player.py
 recorder_optimized.py
 template.py
 episode_32.hdf5
+TCP_IP远程控制接口文档（V3） (1).pdf
+start_camera_shm.sh
+fastdds_shm_config.xml
+examples/dobot_cr5/tcp_servoP_test.py
