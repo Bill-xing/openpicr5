@@ -124,4 +124,4 @@ ros2 topic hz /robot/target_pose  # 应该约30Hz
 | 夹爪范围 | 0-1 (归一化) | 0-1 (归一化) |
 # 分析结果
 
-python examples/dobot_cr5/run_and_analyze.py     --blocking-servo True     --observation-delay-ms 0     --replan-steps 7     --max-steps 400     --prompt "Pick up the red block"
+python examples/dobot_cr5/run_and_analyze.py     --blocking-servo True     --observation-delay-ms 0     --replan-steps 7     --max-steps 400     --prompt "Pick up the red block and place it on the plate"
