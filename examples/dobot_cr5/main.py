@@ -99,6 +99,12 @@ class Args:
     record_dir: str = "./inference_logs"  # 记录数据保存目录
     record_images: bool = False  # 是否记录图像（禁用可显著提升性能）
 
+    # 调试参数
+    servo_only: bool = False  # 仅测试ServoP：不订阅图像/不做推理
+    servo_only_rate_hz: float = 30.0  # ServoP测试频率(Hz)，<=0表示不做限速
+    servo_only_with_camera: bool = False  # Servo-only 时仍订阅相机，用于验证图像订阅影响
+    servo_only_simulate_load_ms: float = 0.0  # Servo-only 模拟推理负载(ms)，如 60 表示每步sleep 60ms
+
 
 class DataLogger:
     """
@@ -386,16 +392,22 @@ def servo_process_worker(cmd_queue: mp.Queue, result_queue: mp.Queue, stop_event
     # 当前目标位姿（持续发送）
     current_pose = None
     pending_result = False  # 是否有等待返回的结果
+    current_cmd_sent = None
 
     # 主循环：持续高频发送 ServoP
     while not stop_event.is_set():
         try:
             # 非阻塞检查是否有新命令
             try:
-                new_pose = cmd_queue.get_nowait()
-                if new_pose is None:  # 停止信号
+                new_cmd = cmd_queue.get_nowait()
+                if new_cmd is None:  # 停止信号
                     break
-                current_pose = new_pose
+                if isinstance(new_cmd, dict):
+                    current_pose = new_cmd.get("pose")
+                    current_cmd_sent = new_cmd.get("t_sent")
+                else:
+                    current_pose = new_cmd
+                    current_cmd_sent = None
                 pending_result = True  # 标记需要返回结果
             except:
                 pass  # 没有新命令，继续使用当前位姿
@@ -412,6 +424,9 @@ def servo_process_worker(cmd_queue: mp.Queue, result_queue: mp.Queue, stop_event
 
             # 调用 ServoP（手动轮询，与 data_collector4.py 一致）
             start_time = time.time()
+            queue_wait_ms = None
+            if current_cmd_sent is not None:
+                queue_wait_ms = (start_time - current_cmd_sent) * 1000
             if cli_servo_p.service_is_ready():
                 future = cli_servo_p.call_async(req)
                 while not future.done():
@@ -426,7 +441,11 @@ def servo_process_worker(cmd_queue: mp.Queue, result_queue: mp.Queue, stop_event
 
             # 如果有等待返回的结果，返回给主进程
             if pending_result:
-                result_queue.put({'elapsed_ms': elapsed_ms, 'success': True})
+                result_queue.put({
+                    'elapsed_ms': elapsed_ms,
+                    'queue_wait_ms': queue_wait_ms,
+                    'success': True
+                })
                 pending_result = False
 
             # 每 100 次打印统计
@@ -593,7 +612,12 @@ class DobotRosWrapper(Node):
     - 订阅相机图像和机器人状态（用于推理）
     """
 
-    def __init__(self, node_name="inference_client"):
+    def __init__(
+        self,
+        node_name="inference_client",
+        enable_camera: bool = True,
+        enable_state: bool = True,
+    ):
         """
         初始化ROS节点和服务客户端
 
@@ -676,21 +700,26 @@ class DobotRosWrapper(Node):
         # === 话题订阅器（用于推理，使用独立回调组）===
         self.robot_state = None
         self.latest_image = None
-        self.bridge = CvBridge()
+        self.camera_enabled = enable_camera
+        self.bridge = CvBridge() if enable_camera else None
 
         # 图像订阅：使用图像回调组（耗时操作，独立线程处理）
-        self.sub_image = self.create_subscription(
-            Image, "/camera/color/image_raw", self._image_callback, sensor_qos,
-            callback_group=self.image_cb_group
-        )
+        self.sub_image = None
+        if enable_camera:
+            self.sub_image = self.create_subscription(
+                Image, "/camera/color/image_raw", self._image_callback, sensor_qos,
+                callback_group=self.image_cb_group
+            )
         # 状态订阅：使用状态回调组
-        self.sub_robot_current = self.create_subscription(
-            ToolVectorActual,
-            "/dobot_msgs_v3/msg/ToolVectorActual",
-            self._robot_current_callback,
-            robot_qos,
-            callback_group=self.state_cb_group
-        )
+        self.sub_robot_current = None
+        if enable_state:
+            self.sub_robot_current = self.create_subscription(
+                ToolVectorActual,
+                "/dobot_msgs_v3/msg/ToolVectorActual",
+                self._robot_current_callback,
+                robot_qos,
+                callback_group=self.state_cb_group
+            )
 
         self.get_logger().info("等待Dobot服务...")
         if not self.cli_enable.wait_for_service(timeout_sec=5.0):
@@ -1030,7 +1059,10 @@ class InferenceClient:
         time.sleep(2.0)
 
         # === 主节点：处理图像、状态订阅和其他服务 ===
-        self.node = DobotRosWrapper()
+        self.node = DobotRosWrapper(
+            enable_camera=(not args.servo_only) or args.servo_only_with_camera,
+            enable_state=True,
+        )
 
         # ROS Spin线程（使用多线程执行器处理图像和状态订阅）
         self.executor = MultiThreadedExecutor(num_threads=4)
@@ -1062,6 +1094,18 @@ class InferenceClient:
             'min_time': float('inf'),
             'max_time': 0.0,
         }
+        self.servo_queue_wait_stats = {
+            'count': 0,
+            'total_time': 0.0,
+            'min_time': float('inf'),
+            'max_time': 0.0,
+        }
+        self.servo_last_detail = {
+            'main_wait_ms': None,
+            'queue_wait_ms': None,
+            'servo_call_ms': None,
+            'extra_wait_ms': None,
+        }
 
         # 初始化夹爪
         self.gripper_comm = GripperComm(self.node)
@@ -1087,6 +1131,9 @@ class InferenceClient:
             'inference_times': deque(maxlen=100),    # 最近100次推理延迟
             'last_inference_time': None,             # 上次推理时间戳
         }
+        # 推理阻塞统计（用于计算剔除推理的控制频率）
+        self.inference_block_time_total = 0.0
+        self.inference_block_count = 0
 
         # 数据记录器
         self.data_logger = None
@@ -1385,6 +1432,9 @@ class InferenceClient:
                 self.perf_stats['inference_count'] += 1
                 self.perf_stats['inference_times'].append(inference_time)
                 self.perf_stats['last_inference_time'] = time.time()
+                # 记录推理阻塞时间（动作队列为空时才会进入推理）
+                self.inference_block_time_total += inference_time
+                self.inference_block_count += 1
 
                 if self.step_count == 0:
                     logging.info(f"First inference completed! Latency: {inference_time*1000:.1f}ms")
@@ -1492,22 +1542,46 @@ class InferenceClient:
         t_servo_call = time.time()
 
         # === 通过独立进程调用 ServoP（高频持续发送模式）===
-        # 发送命令到独立进程
-        self.servo_cmd_queue.put(target_pose)
+        # 发送命令到独立进程（带时间戳用于分解等待时间）
+        t_cmd_sent = time.time()
+        self.servo_cmd_queue.put({"pose": target_pose, "t_sent": t_cmd_sent})
 
         # 等待执行结果（阻塞，确保模型看到稳定状态）
         # 由于独立进程持续高频发送 ServoP，预期延迟应该很低（~11ms）
         try:
             result = self.servo_result_queue.get(timeout=0.5)
             servo_elapsed = result.get('elapsed_ms', 0)
+            queue_wait_ms = result.get('queue_wait_ms')
         except:
             servo_elapsed = 0
+            queue_wait_ms = None
             logging.warning("ServoP 结果超时")
+
+        t_cmd_recv = time.time()
+        main_wait_ms = (t_cmd_recv - t_cmd_sent) * 1000
+        extra_wait_ms = None
+        if queue_wait_ms is not None:
+            extra_wait_ms = main_wait_ms - servo_elapsed - queue_wait_ms
 
         self.servo_stats['count'] += 1
         self.servo_stats['total_time'] += servo_elapsed
         self.servo_stats['min_time'] = min(self.servo_stats['min_time'], servo_elapsed)
         self.servo_stats['max_time'] = max(self.servo_stats['max_time'], servo_elapsed)
+        if queue_wait_ms is not None:
+            self.servo_queue_wait_stats['count'] += 1
+            self.servo_queue_wait_stats['total_time'] += queue_wait_ms
+            self.servo_queue_wait_stats['min_time'] = min(
+                self.servo_queue_wait_stats['min_time'], queue_wait_ms
+            )
+            self.servo_queue_wait_stats['max_time'] = max(
+                self.servo_queue_wait_stats['max_time'], queue_wait_ms
+            )
+        self.servo_last_detail = {
+            'main_wait_ms': main_wait_ms,
+            'queue_wait_ms': queue_wait_ms,
+            'servo_call_ms': servo_elapsed,
+            'extra_wait_ms': extra_wait_ms,
+        }
 
         t_publish = time.time()
 
@@ -1523,6 +1597,15 @@ class InferenceClient:
 
         # DEBUG: 每30步打印一次详细性能
         if self.step_count % 30 == 29:
+            detail = self.servo_last_detail
+            extra_str = ""
+            if detail.get('queue_wait_ms') is not None:
+                extra_str = (
+                    f" | 队列等待:{detail['queue_wait_ms']:.1f}ms"
+                    f" | 主线程等待:{detail['main_wait_ms']:.1f}ms"
+                )
+                if detail.get('extra_wait_ms') is not None:
+                    extra_str += f" | 其它等待:{detail['extra_wait_ms']:.1f}ms"
             logging.info(
                 f"  [execute_action细节] "
                 f"数据准备:{(t_logging-t_data_prep)*1000:.1f}ms | "
@@ -1531,6 +1614,7 @@ class InferenceClient:
                 f"ServoP调用:{(t_publish-t_servo_call)*1000:.1f}ms | "
                 f"发布话题:{(t_gripper-t_publish)*1000:.1f}ms | "
                 f"夹爪:{(t_end-t_gripper)*1000:.1f}ms"
+                f"{extra_str}"
             )
 
     def run(self):
@@ -1546,6 +1630,10 @@ class InferenceClient:
         """
         logging.info("\n=== 开始推理 ===")
         logging.info("按 Ctrl+C 停止\n")
+
+        if self.args.servo_only:
+            self._run_servo_only()
+            return
 
         # 等待初始数据
         logging.info("Waiting for camera and robot data...")
@@ -1633,6 +1721,10 @@ class InferenceClient:
                 if self.step_count % 30 == 0:
                     elapsed = time.time() - start_time
                     action_fps = self.step_count / elapsed if elapsed > 0 else 0
+                    effective_elapsed = elapsed - self.inference_block_time_total
+                    action_fps_no_inf = (
+                        self.step_count / effective_elapsed if effective_elapsed > 0 else 0
+                    )
                     inf_count = self.perf_stats['inference_count']
                     inf_fps = inf_count / elapsed if elapsed > 0 else 0
 
@@ -1653,6 +1745,7 @@ class InferenceClient:
                     logging.info(
                         f"Step {self.step_count} | "
                         f"动作频率: {action_fps:.1f}Hz (目标30) | "
+                        f"动作频率(去推理): {action_fps_no_inf:.1f}Hz | "
                         f"推理频率: {inf_fps:.1f}Hz (预期{30/self.args.replan_steps:.0f}) | "
                         f"推理延迟: {inf_mean:.0f}ms (max:{inf_max:.0f}ms) | "
                         f"队列: {len(self.action_queue)}"
@@ -1665,6 +1758,17 @@ class InferenceClient:
                             f"Min={self.servo_stats['min_time']:.1f}ms, "
                             f"Max={self.servo_stats['max_time']:.1f}ms, "
                             f"Count={self.servo_stats['count']}"
+                        )
+                    if self.servo_queue_wait_stats['count'] > 0:
+                        q_avg = (
+                            self.servo_queue_wait_stats['total_time']
+                            / self.servo_queue_wait_stats['count']
+                        )
+                        logging.info(
+                            f"  QueueWait: Avg={q_avg:.1f}ms, "
+                            f"Min={self.servo_queue_wait_stats['min_time']:.1f}ms, "
+                            f"Max={self.servo_queue_wait_stats['max_time']:.1f}ms, "
+                            f"Count={self.servo_queue_wait_stats['count']}"
                         )
                     logging.info(f"  性能: {perf_str}")
 
@@ -1682,6 +1786,119 @@ class InferenceClient:
         # 等待夹爪到达最终位置
         logging.info("等待夹爪到达最终位置...")
         time.sleep(1.0)
+
+    def _run_servo_only(self):
+        """
+        仅测试 ServoP 的最小循环：
+        - 不订阅图像、不做推理
+        - 以固定频率发送当前位姿
+        """
+        if self.node.camera_enabled:
+            logging.info("Servo-only 模式：订阅图像/不做推理")
+        else:
+            logging.info("Servo-only 模式：不订阅图像/不做推理")
+
+        # 如果订阅相机，确保至少收到一帧，避免订阅未生效
+        if self.node.camera_enabled:
+            wait_start = time.time()
+            while self.node.latest_image is None:
+                if time.time() - wait_start > 5.0:
+                    logging.warning("等待相机图像超时，继续执行 Servo-only 测试")
+                    break
+                time.sleep(0.05)
+
+        # 获取初始位姿
+        target_pose = None
+        if not self.args.dry_run:
+            target_pose = self.get_current_pose()
+            if target_pose is None:
+                logging.error("无法获取初始位姿，退出")
+                return
+            logging.info(f"初始位姿: {target_pose}")
+
+        rate_hz = float(self.args.servo_only_rate_hz)
+        target_dt = 1.0 / rate_hz if rate_hz > 0 else 0.0
+        last_step_time = time.time()
+        start_time = time.time()
+
+        while self.step_count < self.args.max_steps:
+            if rate_hz > 0:
+                elapsed = time.time() - last_step_time
+                if elapsed < target_dt:
+                    time.sleep(target_dt - elapsed)
+                last_step_time = time.time()
+
+            if self.args.dry_run:
+                self.step_count += 1
+                continue
+
+            # 模拟推理负载
+            if self.args.servo_only_simulate_load_ms > 0:
+                time.sleep(self.args.servo_only_simulate_load_ms / 1000.0)
+
+            # 发送当前位姿到 ServoP 进程（带时间戳）
+            t_cmd_sent = time.time()
+            self.servo_cmd_queue.put({"pose": list(target_pose), "t_sent": t_cmd_sent})
+
+            # 阻塞等待结果（用于测量 RTT）
+            blocking = bool(self.args.blocking_servo)
+            if blocking:
+                try:
+                    result = self.servo_result_queue.get(timeout=0.5)
+                    servo_elapsed = result.get('elapsed_ms', 0)
+                    queue_wait_ms = result.get('queue_wait_ms')
+                except Exception:
+                    servo_elapsed = 0
+                    queue_wait_ms = None
+                    logging.warning("ServoP 结果超时")
+                t_cmd_recv = time.time()
+                main_wait_ms = (t_cmd_recv - t_cmd_sent) * 1000
+                extra_wait_ms = None
+                if queue_wait_ms is not None:
+                    extra_wait_ms = main_wait_ms - servo_elapsed - queue_wait_ms
+                self.servo_last_detail = {
+                    'main_wait_ms': main_wait_ms,
+                    'queue_wait_ms': queue_wait_ms,
+                    'servo_call_ms': servo_elapsed,
+                    'extra_wait_ms': extra_wait_ms,
+                }
+                self.servo_stats['count'] += 1
+                self.servo_stats['total_time'] += servo_elapsed
+                self.servo_stats['min_time'] = min(self.servo_stats['min_time'], servo_elapsed)
+                self.servo_stats['max_time'] = max(self.servo_stats['max_time'], servo_elapsed)
+                if queue_wait_ms is not None:
+                    self.servo_queue_wait_stats['count'] += 1
+                    self.servo_queue_wait_stats['total_time'] += queue_wait_ms
+                    self.servo_queue_wait_stats['min_time'] = min(
+                        self.servo_queue_wait_stats['min_time'], queue_wait_ms
+                    )
+                    self.servo_queue_wait_stats['max_time'] = max(
+                        self.servo_queue_wait_stats['max_time'], queue_wait_ms
+                    )
+            else:
+                # 非阻塞时，避免结果队列堆积
+                try:
+                    while True:
+                        self.servo_result_queue.get_nowait()
+                except Exception:
+                    pass
+
+            # 发布目标位姿话题（可用于外部监测）
+            self.publish_robot_target(target_pose)
+
+            self.step_count += 1
+
+            if self.step_count % 30 == 0:
+                elapsed = time.time() - start_time
+                action_fps = self.step_count / elapsed if elapsed > 0 else 0
+                if self.servo_stats['count'] > 0:
+                    servo_avg = self.servo_stats['total_time'] / self.servo_stats['count']
+                    logging.info(
+                        f"Step {self.step_count} | 频率: {action_fps:.1f}Hz | "
+                        f"ServoP Avg={servo_avg:.1f}ms, "
+                        f"Min={self.servo_stats['min_time']:.1f}ms, "
+                        f"Max={self.servo_stats['max_time']:.1f}ms"
+                    )
 
     def close(self):
         """

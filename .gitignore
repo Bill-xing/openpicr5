@@ -201,3 +201,7 @@ inference_logs/inference_log_20260201_205009.h5
 analysis_results/*
 template.py
 episode_32.hdf5
+fastdds_shm_config.xml
+start_camera_shm.sh
+TCP_IP远程控制接口文档（V3） (1).pdf
+examples/dobot_cr5/tcp_servoP_test.py
