@@ -204,7 +204,7 @@ class GripperController(threading.Thread):
                 if real_pos is not None:
                     self.current_pos = float(real_pos)
 
-            time.sleep(0.02)  # 50Hz
+            time.sleep(0.033)  # 30Hz
 
     def stop(self):
         """停止控制线程"""
@@ -558,10 +558,17 @@ class CR5InferenceNode(Node):
                 action = self._get_action(obs)
                 if action is None:
                     continue
-
+                
+                action_starttime = time.time()
                 # 执行动作
                 self._execute_action(action)
                 self.step_count += 1
+                
+                # # 计算动作执行时间，确保每次循环至少1/30秒
+                # action_elapsed = time.time() - action_starttime
+                # target_interval = 1.0 / 30.0  # 1/30秒 ≈ 33.3ms
+                # if action_elapsed < target_interval:
+                    # time.sleep(target_interval - action_elapsed)
 
                 self.last_inference_time = 0.0
 
