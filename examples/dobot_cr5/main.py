@@ -243,22 +243,23 @@ class CR5InferenceNode(Node):
             logging.error(f"Image conversion failed: {e}")
 
     def build_observation(self) -> dict | None:
-        """构建观测数据"""
+        """构建观测数据（与 DobotCR3Inputs 期望格式一致）"""
         if self.robot_state is None or self.latest_image is None:
             return None
 
+        # 图像预处理：BGR→RGB, resize到224x224, uint8
         img = cv2.cvtColor(self.latest_image, cv2.COLOR_BGR2RGB)
         img = image_tools.resize_with_pad(img, self.args.resize_size, self.args.resize_size)
         img = image_tools.convert_to_uint8(img)
 
+        # 读取夹爪位置（原始值 0-1000）
         gripper_pos = self.gripper.read_position() if self.gripper else 1000.0
-        gripper_normalized = gripper_pos / 1000.0
 
-        state = np.concatenate([self.robot_state, [gripper_normalized]]).astype(np.float32)
+        # 状态向量：7D = 6D末端位姿(mm,度) + 1D夹爪开度(原始值)
+        state = np.concatenate([self.robot_state, [gripper_pos]]).astype(np.float32)
 
         return {
             "observation/image": img,
-            "observation/wrist_image": img,
             "observation/state": state,
             "prompt": self.args.prompt,
         }
