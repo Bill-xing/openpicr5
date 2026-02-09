@@ -402,16 +402,14 @@ class LeRobotDobotCR3DataConfig(DataConfigFactory):
         """
         # 1) 重新打包（repack）转换：
         #    将你的 LeRobot 原始字段结构，映射到模型推理/训练管道期望的字段结构。
-        #    这里把 observation.images.top 复用为 image/wrist_image 两个键，
-        #    以满足模型输入对“主视角+腕部视角”的结构要求。
+        #    这里把 observation.images.top 映射为 observation/image。
         #    同时把单数 "action" 重命名为通用的 "actions"。
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        # observation 子结构：模型期望 observation/image、observation/wrist_image、observation/state
+                        # observation 子结构：模型期望 observation/image、observation/state
                         "observation/image": "observation.images.top",
-                        "observation/wrist_image": "observation.images.top",
                         "observation/state": "observation.state",
                         # 统一动作键名到 "actions"
                         "actions": "action",

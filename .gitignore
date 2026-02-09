@@ -201,3 +201,4 @@ TCP_IP远程控制接口文档（V3） (1).pdf
 start_camera_shm.sh
 fastdds_shm_config.xml
 examples/dobot_cr5/tcp_servoP_test.py
+examples/dobot_cr5/9_pi05_inference_dualarm.py

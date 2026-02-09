@@ -29,7 +29,6 @@ class DobotCR3Inputs(transforms.DataTransformFn):
     依据录制与转换脚本（recorder_optimized.py / convert_to_lerobot.py）的输出格式：
     - observation.state: 7D (6D 末端位姿 + 1D 夹爪开度)
     - observation.image: 顶视角图像（由 observation.images.top 重映射而来）
-    - observation.wrist_image: 当前无腕部相机时使用顶视角占位
     - prompt: 由 tasks.jsonl 生成
     """
 
@@ -40,24 +39,21 @@ class DobotCR3Inputs(transforms.DataTransformFn):
         """将单条样本 dict 转为模型期望的输入结构。"""
         # 图像解析：LeRobot 常以 float32 + CHW 存储
         base_image = _parse_image(data["observation/image"])
-        wrist_image = _parse_image(data["observation/wrist_image"])
 
         inputs = {
             # 机器人本体状态（7D）
             "state": data["observation/state"],
-            # 图像输入：主视角 + 腕部视角（占位）
+            # 图像输入：主视角 + 腕部视角（零数组占位）
             "image": {
                 "base_0_rgb": base_image,
-                "left_wrist_0_rgb": wrist_image,
-                # 当前无右腕视角，用零数组占位
+                "left_wrist_0_rgb": np.zeros_like(base_image),
                 "right_wrist_0_rgb": np.zeros_like(base_image),
             },
             # 图像有效性掩码
             "image_mask": {
                 "base_0_rgb": np.True_,
-                "left_wrist_0_rgb": np.True_,
-                # PI0 需要屏蔽占位图像；PI0_FAST 不屏蔽
-                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+                "left_wrist_0_rgb": np.False_,  # 屏蔽，因为没有腕部图像
+                "right_wrist_0_rgb": np.False_,
             },
         }
 
