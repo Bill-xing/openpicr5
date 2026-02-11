@@ -788,7 +788,7 @@ _CONFIGS = [
             # 指向你本地的 LeRobot 数据集目录
             # repo_id="/mnt/data/lv_qi/xing/openpi/src/openpi/lerobot_dataset",
             # repo_id="/mnt/data/lv_qi/xing/openpi/my_data",
-            repo_id="/home/hit/openpi/my_data/my_data",
+            repo_id="/home/hit/openpi/my_data/new_data/new_data",
             # 如果 tasks.jsonl 存在，建议开启 prompt_from_task
             base_config=DataConfig(prompt_from_task=True, video_backend="pyav"),
         ),

@@ -97,7 +97,7 @@ class GripperController:
             return None
         future = client.call_async(request)
         while not future.done():
-            time.sleep(0.001)
+            rclpy.spin_once(self.node, timeout_sec=0.001)
         return future.result()
 
     def _init_modbus(self):
@@ -224,7 +224,7 @@ class CR5InferenceNode(Node):
             return None
         future = client.call_async(request)
         while not future.done():
-            time.sleep(0.001)
+            rclpy.spin_once(self, timeout_sec=0.001)
         return future.result()
 
     def robot_current_callback(self, msg: ToolVectorActual):
@@ -265,23 +265,29 @@ class CR5InferenceNode(Node):
         }
 
     def execute_action(self, action: np.ndarray):
-        """执行单个动作"""
+        """执行单个动作，返回耗时(ms)"""
         target_pose = [float(action[i]) for i in range(6)]
         gripper_target = int(np.clip(float(action[6]), 0, 1000))
 
         if self.args.dry_run:
             logging.info(f"[DRY RUN] pose={target_pose}, gripper={gripper_target}")
-            return
+            return 0.0, 0.0
 
         # ServoP
+        t0 = time.perf_counter()
         req = ServoP.Request()
         req.x, req.y, req.z = target_pose[0], target_pose[1], target_pose[2]
         req.rx, req.ry, req.rz = target_pose[3], target_pose[4], target_pose[5]
         self.call_service(self.cli_servo_p, req)
+        servo_ms = (time.perf_counter() - t0) * 1000
 
         # 夹爪
+        t1 = time.perf_counter()
         if self.gripper:
             self.gripper.set_target(gripper_target)
+        gripper_ms = (time.perf_counter() - t1) * 1000
+
+        return servo_ms, gripper_ms
 
     def enable_robot(self):
         logging.info("Waiting for robot services...")
@@ -373,31 +379,26 @@ def run_inference(args: Args):
             if obs is None:
                 continue
 
-            # 3. 推理获取动作块（不计入控制频率）
-            logging.info(f"[Step {node.step_count}] Calling inference...")
-            t0 = time.time()
+            # 3. 推理获取动作块
+            t_infer_start = time.perf_counter()
             action_chunk = node.policy_client.infer(obs)["actions"]
-            logging.info(f"[Inference] elapsed={((time.time()-t0)*1000):.1f}ms, got {len(action_chunk)} actions")
+            infer_ms = (time.perf_counter() - t_infer_start) * 1000
 
             # 4. 以30Hz频率逐个执行动作
+            t_exec_start = time.perf_counter()
+            actions_executed = 0
             for t in range(min(args.action_horizon, len(action_chunk))):
                 if node.step_count >= args.max_steps:
                     break
 
-                start_loop_t = time.perf_counter()
-
                 action = action_chunk[t]
-                node.execute_action(action)
+                servo_ms, gripper_ms = node.execute_action(action)
+                logging.info(f"[Action {node.step_count}] servo={servo_ms:.1f}ms, gripper={gripper_ms:.1f}ms")
                 node.step_count += 1
+                actions_executed += 1
 
-                if node.step_count % 30 == 0:
-                    logging.info(f"Step {node.step_count}")
-
-                # 严格保持30Hz
-                elapsed = time.perf_counter() - start_loop_t
-                remaining = dt - elapsed
-                if remaining > 0:
-                    time.sleep(remaining)
+            exec_ms = (time.perf_counter() - t_exec_start) * 1000
+            logging.info(f"[Step {node.step_count}] infer={infer_ms:.1f}ms, exec={exec_ms:.1f}ms ({actions_executed} actions)")
 
         logging.info(f"Inference stopped after {node.step_count} steps")
 

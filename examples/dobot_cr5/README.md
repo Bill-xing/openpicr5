@@ -7,6 +7,9 @@ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_dobot_cr3 -
 
 
 
+
+ python examples/dobot_cr5/main.py --prompt "robot_teleoperation" --dry-run --max-steps 10 2>&1 | grep -v "RTPS_READER_HISTORY"
+
 # CR5 真机推理客户端
 
 
