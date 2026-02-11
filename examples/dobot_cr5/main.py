@@ -71,7 +71,7 @@ class Args:
     prompt: str = "pick up the object"  # 任务描述
 
     # 执行参数
-    max_steps: int = 1000  # 最大执行步数
+    max_steps: int = 3000  # 最大执行步数
     dry_run: bool = False  # 空运行模式：只打印动作，不执行
 
 
