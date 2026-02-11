@@ -264,7 +264,7 @@ class CR5InferenceNode(Node):
             "prompt": self.args.prompt,
         }
 
-    def execute_action(self, action: np.ndarray):
+    def execute_action(self, action: np.ndarray, update_gripper: bool = True):
         """执行单个动作，返回耗时(ms)"""
         target_pose = [float(action[i]) for i in range(6)]
         gripper_target = int(np.clip(float(action[6]), 0, 1000))
@@ -281,11 +281,12 @@ class CR5InferenceNode(Node):
         self.call_service(self.cli_servo_p, req)
         servo_ms = (time.perf_counter() - t0) * 1000
 
-        # 夹爪
-        t1 = time.perf_counter()
-        if self.gripper:
+        # 夹爪（仅在需要时更新）
+        gripper_ms = 0.0
+        if update_gripper and self.gripper:
+            t1 = time.perf_counter()
             self.gripper.set_target(gripper_target)
-        gripper_ms = (time.perf_counter() - t1) * 1000
+            gripper_ms = (time.perf_counter() - t1) * 1000
 
         return servo_ms, gripper_ms
 
@@ -384,18 +385,29 @@ def run_inference(args: Args):
             action_chunk = node.policy_client.infer(obs)["actions"]
             infer_ms = (time.perf_counter() - t_infer_start) * 1000
 
-            # 4. 以30Hz频率逐个执行动作
+            # 4. 执行动作（每5次ServoP更新一次夹爪，保持30Hz频率）
             t_exec_start = time.perf_counter()
             actions_executed = 0
+            gripper_update_interval = 5
             for t in range(min(args.action_horizon, len(action_chunk))):
                 if node.step_count >= args.max_steps:
                     break
 
+                start_loop_t = time.perf_counter()
+
                 action = action_chunk[t]
-                servo_ms, gripper_ms = node.execute_action(action)
+                # 每5次更新一次夹爪，使用当前动作的最新夹爪目标值
+                update_gripper = ((t + 1) % gripper_update_interval == 0) or (t == min(args.action_horizon, len(action_chunk)) - 1)
+                servo_ms, gripper_ms = node.execute_action(action, update_gripper=update_gripper)
                 logging.info(f"[Action {node.step_count}] servo={servo_ms:.1f}ms, gripper={gripper_ms:.1f}ms")
                 node.step_count += 1
                 actions_executed += 1
+
+                # 严格保持30Hz
+                elapsed = time.perf_counter() - start_loop_t
+                remaining = dt - elapsed
+                if remaining > 0:
+                    time.sleep(remaining)
 
             exec_ms = (time.perf_counter() - t_exec_start) * 1000
             logging.info(f"[Step {node.step_count}] infer={infer_ms:.1f}ms, exec={exec_ms:.1f}ms ({actions_executed} actions)")
